@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · Workflow Orchestrator{% endblock %}
+
+{% block content %}
+<h1>{{ project.name }}</h1>
+<p class="subtitle mono">{{ project.repo_path }}</p>
+
+<h2>Sessions</h2>
+{% if sessions %}
+<ul class="card-list">
+  {% for session in sessions %}
+  <li>
+    <a href="/ui/sessions/{{ session.id }}">
+      <div class="card">
+        <div class="row">
+          <span class="row-title">{{ session.feature_prompt | truncate(90) }}</span>
+          <span class="badge {% if session.current_phase == 'completed' %}ok{% endif %}">
+            {{ session.current_phase }}
+          </span>
+        </div>
+        <div class="meta">
+          implement: {{ session.harness_implement }} · review: {{ session.harness_review }}
+          · started <span data-reltime="{{ session.created_at }}">{{ session.created_at }}</span>
+        </div>
+      </div>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No sessions yet.</p>
+{% endif %}
+
+<h2>New session</h2>
+<div class="card">
+  <form id="new-session">
+    <label><span>What do you want built?</span>
+      <textarea name="feature_prompt" required
+                placeholder="Rebuild auth to use Auth0 with org-scoped roles"></textarea>
+    </label>
+    <div class="grid-2">
+      <label><span>Implement with</span>
+        <select name="harness_implement">
+          <option value="claude_code" selected>Claude Code</option>
+          <option value="codex">Codex</option>
+        </select>
+      </label>
+      <label><span>Review with</span>
+        <select name="harness_review">
+          <option value="codex" selected>Codex</option>
+          <option value="claude_code">Claude Code</option>
+        </select>
+      </label>
+    </div>
+    <p class="meta">Review always runs on the opposite harness (FR-9).</p>
+    <div class="actions">
+      <button class="primary" type="submit">Start session</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const form = document.getElementById("new-session");
+const implementSelect = form.querySelector('[name="harness_implement"]');
+const reviewSelect = form.querySelector('[name="harness_review"]');
+
+// Keep the two selects opposed client-side so FR-9 is a guard rail, not a
+// surprise 422 after the user has typed a prompt.
+implementSelect.addEventListener("change", () => {
+  reviewSelect.value = implementSelect.value === "claude_code" ? "codex" : "claude_code";
+});
+reviewSelect.addEventListener("change", () => {
+  implementSelect.value = reviewSelect.value === "claude_code" ? "codex" : "claude_code";
+});
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector("button");
+  button.disabled = true;
+  try {
+    const session = await wo.submitJson(event.target, "/projects/{{ project.id }}/sessions");
+    window.location.href = `/ui/sessions/${session.id}`;
+  } catch (err) {
+    wo.toast(err.message, true);
+    button.disabled = false;
+  }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,57 @@
+# Agent run sandbox — SRS NFR-1, OQ-2.
+#
+# Resolves OQ-2 in favour of this project owning the image. Provides `claude`
+# and `codex` on PATH, runs as a non-root user, and expects exactly one host
+# mount: the session worktree at /work.
+#
+#   docker build -t workflow-agent:local -f docker/Dockerfile.agent .
+#   export DOCKER_IMAGE_AGENT=workflow-agent:local
+#
+# Authentication is supplied at run time via forwarded environment variables
+# (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / OPENAI_API_KEY / CODEX_API_KEY).
+# No credential is baked into the image.
+
+FROM node:22-bookworm-slim
+
+ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
+
+# git is needed for the harnesses to read repository history; ripgrep speeds up
+# their search tools; ca-certificates for TLS.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        ca-certificates \
+        git \
+        ripgrep \
+        curl \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force
+
+# NFR-1: non-root. The node image ships a `node` user (uid 1000); alias it to
+# `agent` so the runner's --user flag is stable regardless of base image.
+RUN useradd --uid 1001 --create-home --shell /bin/bash agent
+
+# The session worktree is bind-mounted here and is the only host path visible.
+WORKDIR /work
+
+# Harness state (sessions, caches) must live somewhere writable that is *not*
+# the mounted worktree, or it would pollute the user's repository.
+ENV HOME=/home/agent \
+    CLAUDE_CONFIG_DIR=/home/agent/.claude \
+    CODEX_HOME=/home/agent/.codex \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
+RUN mkdir -p /home/agent/.claude /home/agent/.codex \
+    && chown -R agent:agent /home/agent
+
+USER agent
+
+# Fail fast and visibly if the image is ever built without the CLIs resolving.
+RUN command -v claude && command -v codex
+
+ENTRYPOINT []
+CMD ["/bin/sh", "-c", "claude --version && codex --version"]
