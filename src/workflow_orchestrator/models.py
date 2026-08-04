@@ -107,8 +107,6 @@ class Session(Base):
         CheckConstraint(
             _in_clause("harness_review", _HARNESS_VALUES), name="ck_sessions_harness_review"
         ),
-        # FR-9 / AC-3: enforced at the DB level as well as the API layer.
-        CheckConstraint("harness_implement != harness_review", name="ck_sessions_cross_harness"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
