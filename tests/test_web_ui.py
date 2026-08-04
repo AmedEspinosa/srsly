@@ -48,6 +48,40 @@ async def test_ui_pages_render_html(
     assert "approve-btn" in session_page.text
 
 
+async def test_session_creation_selects_are_independent(
+    client: AsyncClient, project: dict
+) -> None:
+    page = await client.get(f"/ui/projects/{project['id']}")
+
+    assert page.status_code == 200
+    assert page.text.count('value="claude_code"') == 2
+    assert page.text.count('value="codex"') == 2
+    assert "Review always runs on the opposite harness" not in page.text
+    assert "addEventListener(\"change\"" not in page.text
+    assert "opposed client-side" not in page.text
+
+
+async def test_same_harness_session_detail_has_no_cross_harness_annotation(
+    client: AsyncClient, project: dict
+) -> None:
+    response = await client.post(
+        f"/projects/{project['id']}/sessions",
+        json={
+            "feature_prompt": "anything",
+            "harness_implement": "codex",
+            "harness_review": "codex",
+        },
+    )
+    assert response.status_code == 201
+
+    page = await client.get(f"/ui/sessions/{response.json()['id']}")
+    assert page.status_code == 200
+    assert page.text.count("codex") >= 2
+    assert "did not write" not in page.text
+    assert "opposite harness" not in page.text
+    assert "must differ" not in page.text
+
+
 async def test_session_page_marks_current_and_approved_phases(
     client: AsyncClient, session: dict, repo: Path
 ) -> None:

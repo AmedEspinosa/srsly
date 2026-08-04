@@ -40,18 +40,6 @@ class WorkflowError(Exception):
         return {"error": self.error_code, "detail": str(self)}
 
 
-class SameHarnessNotAllowed(WorkflowError):
-    """FR-9 / AC-3."""
-
-    error_code = "same_harness_not_allowed"
-
-    def __str__(self) -> str:  # pragma: no cover - message only
-        return "implement and review harnesses must differ"
-
-    def as_payload(self) -> dict[str, object]:
-        return {"error": self.error_code}
-
-
 class ArtifactMissing(WorkflowError):
     error_code = "artifact_missing"
 
@@ -129,10 +117,6 @@ async def archive_project(db: AsyncSession, project: Project) -> Project:
 async def create_session(
     db: AsyncSession, settings: Settings, project: Project, payload: SessionCreate
 ) -> Session:
-    # FR-9 / AC-3 — enforced at the API layer as well as the DB CHECK.
-    if payload.harness_implement == payload.harness_review:
-        raise SameHarnessNotAllowed()
-
     session = Session(
         project_id=project.id,
         feature_prompt=payload.feature_prompt,
@@ -321,7 +305,6 @@ __all__ = [
     "ArtifactMissing",
     "NotAGitRepo",
     "PhaseError",
-    "SameHarnessNotAllowed",
     "WorkflowError",
     "advance_qa_if_srs_ready",
     "archive_project",

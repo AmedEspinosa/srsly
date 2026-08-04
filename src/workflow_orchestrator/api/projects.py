@@ -60,6 +60,6 @@ async def create_session(
     try:
         session = await workflow.create_session(db, settings, project, payload)
     except workflow.WorkflowError as exc:
-        # AC-3: same harness for implement and review -> 422 same_harness_not_allowed
+        # Keep workflow failures in the API's structured error shape.
         return workflow_error_response(exc)
     return SessionOut.model_validate(session)

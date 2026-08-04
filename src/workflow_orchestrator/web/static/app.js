@@ -39,9 +39,6 @@ function describeError(payload, status) {
   if (payload.error === "phase_not_ready") {
     return `Not ready: approval for "${payload.required_approval}" is required first.`;
   }
-  if (payload.error === "same_harness_not_allowed") {
-    return "Implement and review must use different harnesses.";
-  }
   if (payload.error === "artifact_missing") {
     return `Artifact not found yet: ${payload.artifact_path}`;
   }
