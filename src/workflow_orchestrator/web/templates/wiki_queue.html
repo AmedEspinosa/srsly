@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}Wiki review queue{% endblock %}
+
+{% block content %}
+<h1>Wiki review queue</h1>
+<p class="subtitle">
+  Pages written by automated post-merge ingest, still flagged
+  <span class="mono">needs_review: true</span>. Nothing here has been checked by a
+  human yet.
+</p>
+
+<div class="actions">
+  <button id="lint-run">Run wiki-lint</button>
+  <span class="meta" id="lint-status"></span>
+</div>
+<pre class="artifact" id="lint-output" hidden></pre>
+
+<h2>Pending pages</h2>
+<div id="queue-items"><p class="empty">Loading…</p></div>
+
+<h2>Super summary proposals</h2>
+<p class="meta">
+  Regeneration is proposed, never executed automatically — approve to run it.
+</p>
+<div id="proposals"><p class="empty">Loading…</p></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function escapeHtml(value) {
+  const node = document.createElement("div");
+  node.textContent = value ?? "";
+  return node.innerHTML;
+}
+
+async function loadQueue() {
+  const itemsEl = document.getElementById("queue-items");
+  const proposalsEl = document.getElementById("proposals");
+  try {
+    const data = await wo.api("/wiki/review-queue");
+
+    itemsEl.innerHTML = "";
+    if (!data.items.length) {
+      itemsEl.innerHTML = '<p class="empty">Nothing awaiting review.</p>';
+    }
+    data.items.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML =
+        `<div class="row"><span class="row-title mono">${escapeHtml(item.page_path)}</span>` +
+        `<span class="badge">${item.operation}</span></div>` +
+        `<div class="meta">written ${escapeHtml(item.written_at)}` +
+        (item.index_token_count ? ` · index.md ~${item.index_token_count} tokens` : "") +
+        `</div>`;
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      const diffButton = document.createElement("button");
+      diffButton.textContent = "Show diff";
+      const diffPane = document.createElement("pre");
+      diffPane.className = "artifact";
+      diffPane.hidden = true;
+      diffButton.onclick = async () => {
+        diffButton.disabled = true;
+        try {
+          const result = await wo.api(
+            `/wiki/review-queue/${item.page_path}/diff`);
+          diffPane.textContent = result.diff;
+          diffPane.hidden = false;
+        } catch (err) {
+          wo.toast(err.message, true);
+        } finally {
+          diffButton.disabled = false;
+        }
+      };
+      actions.appendChild(diffButton);
+
+      const approve = document.createElement("button");
+      approve.className = "primary";
+      approve.textContent = "Approve";
+      approve.onclick = () => act(item.page_path, "approve", approve);
+      actions.appendChild(approve);
+
+      const reject = document.createElement("button");
+      reject.className = "danger";
+      reject.textContent = "Reject";
+      reject.onclick = () => act(item.page_path, "reject", reject);
+      actions.appendChild(reject);
+
+      card.appendChild(actions);
+      card.appendChild(diffPane);
+      itemsEl.appendChild(card);
+    });
+
+    proposalsEl.innerHTML = "";
+    if (!data.super_summary_proposals.length) {
+      proposalsEl.innerHTML = '<p class="empty">No pending proposals.</p>';
+    }
+    data.super_summary_proposals.forEach((proposal) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML =
+        `<div class="row"><span class="row-title mono">${escapeHtml(proposal.super_summary_id)}</span></div>` +
+        `<p class="meta">${escapeHtml(proposal.rationale)}</p>`;
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      const approve = document.createElement("button");
+      approve.className = "primary";
+      approve.textContent = "Approve regeneration";
+      approve.onclick = async () => {
+        approve.disabled = true;
+        wo.toast("Regenerating — this runs a wiki agent.");
+        try {
+          await wo.api(`/wiki/super-summary-proposals/${proposal.id}/approve`,
+                       { method: "POST" });
+          await loadQueue();
+        } catch (err) {
+          wo.toast(err.message, true);
+          approve.disabled = false;
+        }
+      };
+      actions.appendChild(approve);
+
+      const reject = document.createElement("button");
+      reject.textContent = "Dismiss";
+      reject.onclick = async () => {
+        reject.disabled = true;
+        try {
+          await wo.api(`/wiki/super-summary-proposals/${proposal.id}/reject`,
+                       { method: "POST" });
+          await loadQueue();
+        } catch (err) {
+          wo.toast(err.message, true);
+          reject.disabled = false;
+        }
+      };
+      actions.appendChild(reject);
+
+      card.appendChild(actions);
+      proposalsEl.appendChild(card);
+    });
+  } catch (err) {
+    itemsEl.innerHTML = `<p class="empty">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function act(pagePath, action, button) {
+  button.disabled = true;
+  try {
+    await wo.api(`/wiki/review-queue/${pagePath}/${action}`, { method: "POST" });
+    await loadQueue();
+  } catch (err) {
+    wo.toast(err.message, true);
+    button.disabled = false;
+  }
+}
+
+document.getElementById("lint-run").addEventListener("click", async (event) => {
+  event.target.disabled = true;
+  const statusEl = document.getElementById("lint-status");
+  const outputEl = document.getElementById("lint-output");
+  statusEl.textContent = "linting…";
+  try {
+    const result = await wo.api("/wiki/lint", { method: "POST" });
+    statusEl.textContent = result.ok
+      ? "clean"
+      : `${result.total_problems} problem(s)`;
+    outputEl.textContent = (result.issues || []).join("\n") ||
+      JSON.stringify(result.counts, null, 2);
+    outputEl.hidden = false;
+  } catch (err) {
+    statusEl.textContent = "";
+    wo.toast(err.message, true);
+  } finally {
+    event.target.disabled = false;
+  }
+});
+
+loadQueue();
+</script>
+{% endblock %}

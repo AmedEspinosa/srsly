@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Projects · Workflow Orchestrator{% endblock %}
+
+{% block content %}
+<h1>Projects</h1>
+<p class="subtitle">Each project points at a local Git repository and a consolidated wiki repo.</p>
+
+{% if projects %}
+<ul class="card-list">
+  {% for project in projects %}
+  <li>
+    <a href="/ui/projects/{{ project.id }}">
+      <div class="card">
+        <div class="row">
+          <span class="row-title">{{ project.name }}</span>
+          <span class="meta mono">{{ project.repo_path }}</span>
+        </div>
+        <div class="meta">
+          wiki: <span class="mono">{{ project.wiki_repo_path }}</span>
+          · created <span data-reltime="{{ project.created_at }}">{{ project.created_at }}</span>
+        </div>
+      </div>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No projects yet. Create one below.</p>
+{% endif %}
+
+<h2>New project</h2>
+<div class="card">
+  <form id="new-project">
+    <label><span>Name</span><input name="name" required placeholder="load-scorer"></label>
+    <label><span>Repository path</span>
+      <input name="repo_path" required placeholder="/Users/you/Projects/my-app">
+    </label>
+    <label><span>Wiki repo path</span>
+      <input name="wiki_repo_path" required placeholder="/Users/you/Projects/wiki">
+    </label>
+    <label><span>Super summary path (relative to the wiki repo)</span>
+      <input name="wiki_super_summary_path" required
+             value="llm-wiki/super-summaries/{{ '{project-id}' }}.md">
+    </label>
+    <div class="actions">
+      <button class="primary" type="submit">Create project</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById("new-project").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector("button");
+  button.disabled = true;
+  try {
+    const project = await wo.submitJson(event.target, "/projects");
+    window.location.href = `/ui/projects/${project.id}`;
+  } catch (err) {
+    wo.toast(err.message, true);
+    button.disabled = false;
+  }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,810 @@
+{% extends "base.html" %}
+{% block title %}Session · {{ session.feature_prompt | truncate(40) }}{% endblock %}
+
+{% block content %}
+<h1>{{ session.feature_prompt | truncate(110) }}</h1>
+<p class="subtitle">
+  <a href="/ui/projects/{{ project.id }}">{{ project.name }}</a>
+  · implement <strong>{{ session.harness_implement }}</strong>
+  · review <strong>{{ session.harness_review }}</strong>
+  {% if session.pr_url %}· <a href="{{ session.pr_url }}" target="_blank" rel="noopener">PR #{{ session.pr_number }}</a>{% endif %}
+</p>
+
+<ul class="stepper">
+  {% for phase in phase_order %}
+  <li class="step
+      {%- if phase in approved_phases %} done{% endif %}
+      {%- if phase == session.current_phase %} current{% endif %}">
+    {{ phase }}
+  </li>
+  {% endfor %}
+</ul>
+
+{% if session.current_phase == "review" %}
+<h2>Review triage</h2>
+<div class="card">
+  <p class="meta">
+    Reviewed by <strong>{{ session.harness_review }}</strong> — the harness that
+    did <em>not</em> write the code. Seeded with
+    <span class="mono">srs.md</span> and <span class="mono">plan.md</span>.
+  </p>
+  <div class="actions">
+    <button class="primary" id="review-run">Run review</button>
+    <span class="meta" id="review-status"></span>
+  </div>
+  <div id="findings"></div>
+  <details id="review-prose-wrap" hidden>
+    <summary>Full review document</summary>
+    <pre class="artifact" id="review-prose"></pre>
+  </details>
+</div>
+{% endif %}
+
+{% if session.current_phase == "completed" %}
+<h2>As-built</h2>
+<div class="card">
+  <p class="meta">
+    Written after the merge by the <strong>{{ session.harness_review }}</strong>
+    harness and ingested into the wiki: every requirement in the SRS, checked
+    against the code that actually shipped. The SRS records what was proposed —
+    this records what exists.
+  </p>
+  <p class="meta" id="as-built-summary">loading…</p>
+  <table id="as-built-table" hidden>
+    <thead>
+      <tr><th>Requirement</th><th>Status</th><th>Where</th><th>Note</th></tr>
+    </thead>
+    <tbody id="as-built-rows"></tbody>
+  </table>
+  <details id="as-built-prose-wrap" hidden>
+    <summary>Full as-built document</summary>
+    <pre class="artifact" id="as-built-prose"></pre>
+  </details>
+</div>
+{% endif %}
+
+{% if session.current_phase == "merge" %}
+<h2>Merge</h2>
+<div class="card">
+  <p class="meta">
+    Pushes <span class="mono">workflow/{{ session.id }}</span> and opens a pull
+    request. The SRS, plan and review stay out of the commit (§4.5); an as-built
+    record reconciling them against what shipped is produced after the merge.
+    Merge state is polled every {{ merge_poll_seconds }}s; the session completes
+    automatically on merge.
+  </p>
+  <div class="actions">
+    <button class="primary" id="merge-open">Push branch &amp; open PR</button>
+    <button id="merge-refresh">Check merge state</button>
+    <span class="meta" id="merge-status"></span>
+  </div>
+  {% if session.pr_url %}
+  <p>
+    <a href="{{ session.pr_url }}" target="_blank" rel="noopener">
+      PR #{{ session.pr_number }}</a>
+    · <span class="badge">{{ session.pr_state or "unknown" }}</span>
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if session.current_phase == "implement" %}
+<h2>Implementation</h2>
+<div class="card">
+  <p class="meta">
+    Runs the <strong>{{ session.harness_implement }}</strong> harness detached
+    against <span class="mono">.workflow/plan.md</span>. The run survives a
+    restart of this server; reconnecting replays the whole log.
+  </p>
+  <div class="actions">
+    <button class="primary" id="impl-run">Start implementation run</button>
+    <button id="impl-cancel" hidden>Cancel run</button>
+    <span class="meta" id="impl-status"></span>
+  </div>
+  <div class="row meta" id="impl-meters" hidden>
+    <span>elapsed <strong id="meter-elapsed">0s</strong></span>
+    <span>tokens <strong id="meter-tokens">0</strong></span>
+    <span>cost <strong id="meter-cost">$0.0000</strong></span>
+    <span>limit <strong>${{ "%.2f"|format(cost_ceiling) }} / {{ timeout_minutes }}m</strong></span>
+  </div>
+  <pre class="logstream" id="impl-log" hidden></pre>
+  <div class="actions">
+    <button id="impl-diff">Show diff</button>
+  </div>
+  <pre class="artifact" id="impl-diff-output" hidden></pre>
+</div>
+{% endif %}
+
+{% if session.current_phase == "plan" %}
+<h2>Plan</h2>
+<div class="card">
+  <p class="meta">
+    Runs the <strong>{{ session.harness_implement }}</strong> harness in read-only
+    mode: it reads <span class="mono">.workflow/srs.md</span> and the repository,
+    and produces <span class="mono">.workflow/plan.md</span> without touching source.
+  </p>
+  <div class="actions">
+    <button class="primary" id="plan-run">Generate plan</button>
+    <span class="meta" id="plan-status"></span>
+  </div>
+  <pre class="artifact" id="plan-output" hidden></pre>
+</div>
+{% endif %}
+
+{% if session.current_phase == "qa" %}
+<h2>Clarifying questions</h2>
+<div class="card" id="qa-panel">
+  <p class="meta" id="qa-context">Checking wiki context…</p>
+  <p class="meta" id="qa-round">Loading…</p>
+  <div id="qa-questions"></div>
+  <div class="actions" id="qa-actions" hidden>
+    <button class="primary" id="qa-submit">Submit answers</button>
+    <button id="qa-finalize">Skip remaining questions &amp; write the SRS</button>
+    <button id="qa-restart" title="Discard this transcript and ask again with fresh wiki context">Restart with wiki context</button>
+  </div>
+</div>
+{% endif %}
+
+<h2>Artifacts</h2>
+<div class="card">
+  <div class="actions" style="margin-top:0">
+    {% for phase, relative in phase_artifacts %}
+    <button type="button" data-artifact="{{ phase }}">{{ relative }}</button>
+    {% endfor %}
+  </div>
+  <pre class="artifact" id="artifact-view">Select an artifact above.</pre>
+</div>
+
+<h2>Approval</h2>
+<div class="card">
+  <p class="meta">
+    Current phase: <strong>{{ session.current_phase }}</strong>.
+    {% if current_artifact %}
+      Approving records an immutable, timestamped approval against
+      <span class="mono">{{ current_artifact }}</span> and advances the session.
+    {% else %}
+      This phase has no artifact to approve.
+    {% endif %}
+  </p>
+  <label><span>Notes (optional)</span><input id="approval-notes" placeholder=""></label>
+  <div class="actions">
+    <button class="primary" id="approve-btn"
+            {% if session.current_phase == "completed" %}disabled{% endif %}>
+      Approve {{ session.current_phase }}
+    </button>
+    <button class="danger" id="reject-btn"
+            {% if session.current_phase == "completed" %}disabled{% endif %}>
+      Reject &amp; go back
+    </button>
+  </div>
+</div>
+
+<h2>Recorded approvals</h2>
+{% if session.approvals %}
+<div class="card">
+  <table>
+    <thead><tr><th>Phase</th><th>Approved at</th><th>By</th><th>Notes</th></tr></thead>
+    <tbody>
+      {% for approval in session.approvals %}
+      <tr>
+        <td>{{ approval.phase }}</td>
+        <td class="mono">{{ approval.approved_at }}</td>
+        <td>{{ approval.approved_by }}</td>
+        <td>{{ approval.notes or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty">No approvals recorded yet.</p>
+{% endif %}
+
+{% if session.runs %}
+<h2>Runs</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>Phase</th><th>Harness</th><th>Status</th><th>Cost</th><th>Started</th></tr></thead>
+    <tbody>
+      {% for run in session.runs %}
+      <tr>
+        <td><a href="/ui/sessions/{{ session.id }}/runs/{{ run.id }}">{{ run.phase }}</a></td>
+        <td>{{ run.harness }}</td>
+        <td><span class="badge {{ 'ok' if run.status == 'completed' else ('bad' if run.status in ('failed','timed_out','cost_exceeded') else '') }}">{{ run.status }}</span></td>
+        <td class="mono">${{ "%.4f"|format(run.cost_usd) }}</td>
+        <td class="mono">{{ run.started_at or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<h2>Worktree</h2>
+<div class="card"><span class="mono">{{ worktree_path }}</span></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SESSION_ID = "{{ session.id }}";
+const CURRENT_PHASE = "{{ session.current_phase }}";
+
+// ── Review phase: findings triage (FR-23..FR-26) ────────────────────────────
+const reviewButton = document.getElementById("review-run");
+if (reviewButton) {
+  const statusEl = document.getElementById("review-status");
+  const listEl = document.getElementById("findings");
+  const proseWrap = document.getElementById("review-prose-wrap");
+
+  const SEVERITY_CLASS = { high: "bad", medium: "warn", low: "" };
+
+  function renderFindings(findings) {
+    listEl.innerHTML = "";
+    if (!findings.length) {
+      listEl.innerHTML = '<p class="empty">No findings.</p>';
+      return;
+    }
+    findings.forEach((finding) => {
+      const card = document.createElement("div");
+      card.className = "card";
+
+      const head = document.createElement("div");
+      head.className = "row";
+      head.innerHTML =
+        `<span class="badge ${SEVERITY_CLASS[finding.severity] ?? ""}">${finding.severity}</span>` +
+        `<span class="row-title">${escapeHtml(finding.title)}</span>` +
+        `<span class="badge">${finding.status}</span>`;
+      card.appendChild(head);
+
+      if (finding.file) {
+        const loc = document.createElement("div");
+        loc.className = "meta mono";
+        loc.textContent = finding.file + (finding.line ? `:${finding.line}` : "");
+        card.appendChild(loc);
+      }
+      if (finding.detail) {
+        const detail = document.createElement("p");
+        detail.className = "meta";
+        detail.textContent = finding.detail;
+        card.appendChild(detail);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      // FR-25: every finding is individually dismissible or actionable.
+      const fix = document.createElement("button");
+      fix.textContent = "Fix this";
+      fix.disabled = finding.status === "fixing";
+      fix.onclick = () => triage(finding.id, "fix", fix);
+      actions.appendChild(fix);
+
+      const toggle = document.createElement("button");
+      const dismissed = finding.status === "dismissed";
+      toggle.textContent = dismissed ? "Reopen" : "Dismiss";
+      toggle.onclick = () => triage(finding.id, dismissed ? "reopen" : "dismiss", toggle);
+      actions.appendChild(toggle);
+
+      card.appendChild(actions);
+      listEl.appendChild(card);
+    });
+  }
+
+  function escapeHtml(value) {
+    const node = document.createElement("div");
+    node.textContent = value;
+    return node.innerHTML;
+  }
+
+  async function triage(findingId, action, button) {
+    button.disabled = true;
+    try {
+      await wo.api(
+        `/sessions/${SESSION_ID}/review/findings/${encodeURIComponent(findingId)}/${action}`,
+        { method: "POST" },
+      );
+      if (action === "fix") wo.toast("Follow-up run started.");
+      await load();
+    } catch (err) {
+      wo.toast(err.message, true);
+      button.disabled = false;
+    }
+  }
+
+  async function load() {
+    try {
+      const data = await wo.api(`/sessions/${SESSION_ID}/review/findings`);
+      if (!data.exists) {
+        listEl.innerHTML = '<p class="empty">No review yet — run one above.</p>';
+        return;
+      }
+      renderFindings(data.findings);
+      document.getElementById("review-prose").textContent = data.content;
+      proseWrap.hidden = false;
+      statusEl.textContent = `${data.outstanding} outstanding of ${data.findings.length}`;
+    } catch (err) {
+      wo.toast(err.message, true);
+    }
+  }
+
+  reviewButton.addEventListener("click", async () => {
+    reviewButton.disabled = true;
+    statusEl.textContent = "reviewing… this can take several minutes.";
+    try {
+      const result = await wo.api(`/sessions/${SESSION_ID}/review/run`, { method: "POST" });
+      renderFindings(result.findings);
+      await load();
+    } catch (err) {
+      statusEl.textContent = "";
+      wo.toast(err.message, true);
+    } finally {
+      reviewButton.disabled = false;
+    }
+  });
+
+  load();
+}
+
+// ── Merge phase (FR-27..FR-30) ──────────────────────────────────────────────
+const mergeButton = document.getElementById("merge-open");
+if (mergeButton) {
+  const statusEl = document.getElementById("merge-status");
+
+  mergeButton.addEventListener("click", async () => {
+    mergeButton.disabled = true;
+    statusEl.textContent = "pushing and opening the PR…";
+    try {
+      const pr = await wo.api(`/sessions/${SESSION_ID}/merge/open-pr`, { method: "POST" });
+      statusEl.textContent = `PR #${pr.number} opened`;
+      window.location.reload();
+    } catch (err) {
+      statusEl.textContent = "";
+      wo.toast(err.message, true);
+      mergeButton.disabled = false;
+    }
+  });
+
+  document.getElementById("merge-refresh").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    try {
+      const state = await wo.api(`/sessions/${SESSION_ID}/merge/status`);
+      statusEl.textContent = `state: ${state.state}`;
+      if (state.merged) window.location.reload();
+    } catch (err) {
+      wo.toast(err.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  });
+}
+
+// ── As-built: what shipped, versus what the SRS proposed ────────────────────
+const asBuiltSummary = document.getElementById("as-built-summary");
+if (asBuiltSummary) {
+  // Dropped and deviated requirements sort first server-side — they are the
+  // reason this panel exists, so they must not be buried under the passes.
+  const BADGES = { dropped: "bad", deviated: "warn", unverified: "warn", implemented: "ok" };
+
+  (async () => {
+    try {
+      const data = await wo.api(`/sessions/${SESSION_ID}/as-built`);
+      if (!data.exists) {
+        asBuiltSummary.textContent =
+          "Not written yet — it is produced by the post-merge write-back.";
+        return;
+      }
+
+      const c = data.counts || {};
+      asBuiltSummary.textContent = data.gaps
+        ? `${data.gaps} of ${data.requirements.length} requirements did not ship as specified `
+          + `— ${c.dropped || 0} dropped, ${c.deviated || 0} deviated, ${c.unverified || 0} unverified.`
+        : `All ${data.requirements.length} requirements implemented as specified.`;
+
+      const rows = document.getElementById("as-built-rows");
+      rows.innerHTML = "";
+      // Built from text nodes rather than innerHTML: every field here is
+      // harness-generated prose.
+      const cell = (tr, text, className) => {
+        const td = document.createElement("td");
+        if (className) td.className = className;
+        td.textContent = text;
+        tr.appendChild(td);
+        return td;
+      };
+      for (const req of data.requirements) {
+        const tr = document.createElement("tr");
+        cell(tr, req.id, "mono");
+
+        const statusCell = cell(tr, "", "");
+        const badge = document.createElement("span");
+        badge.className = `badge ${BADGES[req.status] || ""}`;
+        badge.textContent = req.status;
+        statusCell.appendChild(badge);
+
+        cell(tr, req.location || "—", "mono");
+        cell(tr, req.note || "", "");
+        rows.appendChild(tr);
+      }
+      document.getElementById("as-built-table").hidden = false;
+
+      if (data.content) {
+        document.getElementById("as-built-prose").textContent = data.content;
+        document.getElementById("as-built-prose-wrap").hidden = false;
+      }
+    } catch (err) {
+      asBuiltSummary.textContent = `could not load: ${err.message}`;
+    }
+  })();
+}
+
+// ── Implement phase: detached run + live SSE (FR-18..FR-22) ─────────────────
+const implButton = document.getElementById("impl-run");
+if (implButton) {
+  const statusEl = document.getElementById("impl-status");
+  const logEl = document.getElementById("impl-log");
+  const metersEl = document.getElementById("impl-meters");
+  const cancelButton = document.getElementById("impl-cancel");
+  const RUNNING_RUN_ID = {{ (running_run.id | tojson) if running_run else "null" }};
+  let source = null;
+  let activeRunId = null;
+  let startedAt = null;
+  let ticker = null;
+
+  function fmtElapsed(ms) {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
+
+  function attach(runId) {
+    activeRunId = runId;
+    startedAt = startedAt || Date.now();
+    logEl.hidden = false;
+    metersEl.hidden = false;
+    cancelButton.hidden = false;
+    implButton.disabled = true;
+    statusEl.textContent = "running…";
+
+    ticker = setInterval(() => {
+      document.getElementById("meter-elapsed").textContent =
+        fmtElapsed(Date.now() - startedAt);
+    }, 1000);
+
+    // The stream replays everything the run has emitted, so a late connect (or
+    // a reconnect after a server restart) shows the full history.
+    source = new EventSource(`/sessions/${SESSION_ID}/runs/${runId}/stream`);
+
+    source.addEventListener("run", (message) => {
+      const event = JSON.parse(message.data);
+      if (event.text) {
+        logEl.textContent += event.event_type === "text_delta"
+          ? event.text
+          : `\n[${event.event_type}] ${event.text}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      if (event.token_count != null) {
+        document.getElementById("meter-tokens").textContent =
+          event.token_count.toLocaleString();
+      }
+      if (event.cost_usd != null) {
+        document.getElementById("meter-cost").textContent =
+          `$${event.cost_usd.toFixed(4)}`;
+      }
+    });
+
+    source.addEventListener("done", () => {
+      statusEl.textContent = "run finished — reloading…";
+      cleanup();
+      setTimeout(() => window.location.reload(), 900);
+    });
+
+    source.onerror = () => {
+      statusEl.textContent = "stream interrupted — reconnecting…";
+    };
+  }
+
+  function cleanup() {
+    if (source) { source.close(); source = null; }
+    if (ticker) { clearInterval(ticker); ticker = null; }
+    cancelButton.hidden = true;
+  }
+
+  implButton.addEventListener("click", async () => {
+    implButton.disabled = true;
+    statusEl.textContent = "launching…";
+    logEl.textContent = "";
+    try {
+      const run = await wo.api(`/sessions/${SESSION_ID}/implement/run`, { method: "POST" });
+      attach(run.id);
+    } catch (err) {
+      statusEl.textContent = "";
+      wo.toast(err.message, true);
+      implButton.disabled = false;
+    }
+  });
+
+  cancelButton.addEventListener("click", async () => {
+    if (!activeRunId) return;
+    cancelButton.disabled = true;
+    try {
+      await wo.api(`/sessions/${SESSION_ID}/runs/${activeRunId}/cancel`, { method: "POST" });
+      statusEl.textContent = "cancelling…";
+    } catch (err) {
+      wo.toast(err.message, true);
+      cancelButton.disabled = false;
+    }
+  });
+
+  document.getElementById("impl-diff").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    const out = document.getElementById("impl-diff-output");
+    try {
+      const result = await wo.api(`/sessions/${SESSION_ID}/diff`);
+      out.textContent = result.empty ? "(no changes in the worktree)" : result.diff;
+      out.hidden = false;
+    } catch (err) {
+      wo.toast(err.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  });
+
+  // A run already in flight (e.g. the page was reloaded, or the server was
+  // restarted mid-run) reattaches automatically.
+  if (RUNNING_RUN_ID) attach(RUNNING_RUN_ID);
+}
+
+// ── Plan phase (FR-15..FR-17) ───────────────────────────────────────────────
+const planButton = document.getElementById("plan-run");
+if (planButton) {
+  const statusEl = document.getElementById("plan-status");
+  const outputEl = document.getElementById("plan-output");
+  planButton.addEventListener("click", async () => {
+    planButton.disabled = true;
+    statusEl.textContent = "Planning… this can take a few minutes.";
+    try {
+      const result = await wo.api(`/sessions/${SESSION_ID}/plan/run`, { method: "POST" });
+      outputEl.textContent = result.content;
+      outputEl.hidden = false;
+      statusEl.textContent = "plan.md written — review it, then approve below.";
+    } catch (err) {
+      statusEl.textContent = "";
+      wo.toast(err.message, true);
+    } finally {
+      planButton.disabled = false;
+    }
+  });
+}
+
+// ── QA phase: the 5x5 clarifying-question loop (FR-10..FR-13) ───────────────
+const qaPanel = document.getElementById("qa-panel");
+if (qaPanel) {
+  const roundEl = document.getElementById("qa-round");
+  const contextEl = document.getElementById("qa-context");
+  const questionsEl = document.getElementById("qa-questions");
+  const actionsEl = document.getElementById("qa-actions");
+  let currentQuestions = [];
+
+  // Question quality is downstream of the wiki context, so say plainly whether
+  // it made it in. Without this, an unconfigured wiki looks like a bad model.
+  async function showContext() {
+    try {
+      const c = await wo.api(`/sessions/${SESSION_ID}/qa/context`);
+      const parts = [];
+      if (c.super_summary_found) {
+        parts.push(`super summary (${(c.super_summary_chars / 1024).toFixed(1)} KB)`);
+      }
+      if (c.pages.length) parts.push(`${c.pages.length} wiki page(s)`);
+
+      if (c.injected && parts.length) {
+        contextEl.textContent = `Wiki context: ${parts.join(" + ")}`;
+        contextEl.style.color = "";
+      } else if (c.available) {
+        contextEl.textContent =
+          `Wiki context available (${parts.join(" + ")}) but NOT in this transcript` +
+          " — use “Restart with wiki context”.";
+        contextEl.style.color = "var(--warn, #b45309)";
+      } else {
+        contextEl.textContent = `No wiki context. ${c.hint || ""}`;
+        contextEl.style.color = "var(--warn, #b45309)";
+      }
+    } catch (err) {
+      contextEl.textContent = `Wiki context unknown: ${err.message}`;
+    }
+  }
+
+  function renderQuestion(question) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "card";
+    wrapper.dataset.questionId = question.id;
+
+    const label = document.createElement("p");
+    label.textContent = question.text;
+    label.style.fontWeight = "600";
+    wrapper.appendChild(label);
+
+    if (question.type === "single_select" || question.type === "multi_select") {
+      const multi = question.type === "multi_select";
+      question.options.forEach((option, index) => {
+        const row = document.createElement("label");
+        row.style.display = "flex";
+        row.style.gap = "0.5rem";
+        row.style.alignItems = "flex-start";
+        const input = document.createElement("input");
+        input.type = multi ? "checkbox" : "radio";
+        input.name = `q-${question.id}`;
+        input.value = option;
+        input.style.width = "auto";
+        input.dataset.role = "option";
+        if (!multi && index === 0) input.checked = true;
+        row.appendChild(input);
+        row.appendChild(document.createTextNode(option));
+        wrapper.appendChild(row);
+      });
+      if (question.allow_custom) {
+        const custom = document.createElement("input");
+        custom.dataset.role = "custom";
+        custom.placeholder = question.placeholder || "Something else…";
+        wrapper.appendChild(custom);
+      }
+    } else {
+      const input = document.createElement("textarea");
+      input.dataset.role = "text";
+      input.placeholder = question.placeholder || "";
+      wrapper.appendChild(input);
+    }
+    return wrapper;
+  }
+
+  function collectAnswers() {
+    return currentQuestions.map((question) => {
+      const node = questionsEl.querySelector(`[data-question-id="${question.id}"]`);
+      if (!node) return { question_id: question.id, answer: "" };
+
+      const textArea = node.querySelector('[data-role="text"]');
+      if (textArea) return { question_id: question.id, answer: textArea.value };
+
+      const selected = [...node.querySelectorAll('[data-role="option"]')]
+        .filter((input) => input.checked)
+        .map((input) => input.value);
+      const custom = node.querySelector('[data-role="custom"]');
+      if (custom && custom.value.trim()) selected.push(custom.value.trim());
+
+      if (question.type === "multi_select") {
+        return { question_id: question.id, answer: selected };
+      }
+      return { question_id: question.id, answer: selected[0] || "" };
+    });
+  }
+
+  function render(state) {
+    currentQuestions = state.questions || [];
+    questionsEl.innerHTML = "";
+
+    if (state.srs_written) {
+      roundEl.textContent = "SRS written — reloading…";
+      actionsEl.hidden = true;
+      window.location.reload();
+      return;
+    }
+
+    roundEl.textContent =
+      `Round ${state.round} of ${state.max_rounds}` +
+      (currentQuestions.length ? ` · ${currentQuestions.length} question(s)` : "");
+
+    if (!currentQuestions.length) {
+      questionsEl.innerHTML =
+        '<p class="empty">No questions pending. Writing the SRS…</p>';
+      actionsEl.hidden = true;
+      return;
+    }
+
+    currentQuestions.forEach((q) => questionsEl.appendChild(renderQuestion(q)));
+    actionsEl.hidden = false;
+  }
+
+  async function load() {
+    try {
+      let state = await wo.api(`/sessions/${SESSION_ID}/qa`);
+      if (state.awaiting_first_prompt) {
+        roundEl.textContent = "Retrieving wiki context and asking the first round…";
+        state = await wo.api(`/sessions/${SESSION_ID}/qa/start`, { method: "POST" });
+      }
+      render(state);
+    } catch (err) {
+      roundEl.textContent = err.message;
+      wo.toast(err.message, true);
+    }
+  }
+
+  document.getElementById("qa-submit").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    roundEl.textContent = "Thinking…";
+    try {
+      render(await wo.api(`/sessions/${SESSION_ID}/qa/answer`, {
+        method: "POST",
+        body: JSON.stringify({ answers: collectAnswers(), end_early: false }),
+      }));
+    } catch (err) {
+      wo.toast(err.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  });
+
+  document.getElementById("qa-finalize").addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    roundEl.textContent = "Writing the SRS…";
+    try {
+      render(await wo.api(`/sessions/${SESSION_ID}/qa/answer`, {
+        method: "POST",
+        body: JSON.stringify({ answers: collectAnswers(), end_early: true }),
+      }));
+    } catch (err) {
+      wo.toast(err.message, true);
+      event.target.disabled = false;
+    }
+  });
+
+  document.getElementById("qa-restart").addEventListener("click", async (event) => {
+    if (!window.confirm("Discard this Q&A transcript and start over with wiki context?")) {
+      return;
+    }
+    event.target.disabled = true;
+    roundEl.textContent = "Retrieving wiki context and asking the first round…";
+    try {
+      render(await wo.api(`/sessions/${SESSION_ID}/qa/restart`, { method: "POST" }));
+      await showContext();
+    } catch (err) {
+      wo.toast(err.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  });
+
+  load().then(showContext);
+}
+
+document.querySelectorAll("[data-artifact]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const view = document.getElementById("artifact-view");
+    view.textContent = "Loading…";
+    try {
+      const data = await wo.api(`/sessions/${SESSION_ID}/artifacts/${button.dataset.artifact}`);
+      view.textContent = data.exists ? data.content : `Not written yet: ${data.path}`;
+    } catch (err) {
+      view.textContent = err.message;
+    }
+  });
+});
+
+document.getElementById("approve-btn").addEventListener("click", async (event) => {
+  event.target.disabled = true;
+  const notes = document.getElementById("approval-notes").value || null;
+  try {
+    await wo.api(`/sessions/${SESSION_ID}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ phase: CURRENT_PHASE, notes }),
+    });
+    window.location.reload();
+  } catch (err) {
+    wo.toast(err.message, true);
+    event.target.disabled = false;
+  }
+});
+
+document.getElementById("reject-btn").addEventListener("click", async (event) => {
+  event.target.disabled = true;
+  const notes = document.getElementById("approval-notes").value || null;
+  try {
+    await wo.api(`/sessions/${SESSION_ID}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ notes }),
+    });
+    window.location.reload();
+  } catch (err) {
+    wo.toast(err.message, true);
+    event.target.disabled = false;
+  }
+});
+</script>
+{% endblock %}

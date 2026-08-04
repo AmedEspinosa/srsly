@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Workflow Orchestrator{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- Deliberately NOT deferred. Page templates put their logic in inline
+       <script> blocks at the end of <body>, and those execute during parsing —
+       i.e. before any deferred script. Deferring this one made every page that
+       calls wo.* at load time fail with "wo is not defined". -->
+  <script src="/static/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">workflow&nbsp;orchestrator</a>
+    <nav>
+      <a href="/">Projects</a>
+      <a href="/ui/wiki-queue">Wiki queue</a>
+    </nav>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

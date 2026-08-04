@@ -1,0 +1,52 @@
+[project]
+name = "workflow-orchestrator"
+version = "0.1.0"
+description = "AI-driven development workflow orchestrator"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20",
+    "alembic>=1.14",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "typer>=0.15",
+    "structlog>=24.4",
+    "sse-starlette>=2.1",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.20",
+    "boto3>=1.35",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+workflow-orchestrator = "workflow_orchestrator.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "anyio>=4.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workflow_orchestrator"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "acceptance: SRS §7 acceptance criteria (spawns real subprocesses; slower)",
+    "docker: requires a running Docker daemon",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
