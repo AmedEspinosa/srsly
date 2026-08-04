@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Integer,
@@ -117,6 +118,12 @@ class Session(Base):
     harness_implement: Mapped[str] = mapped_column(String, nullable=False)
     harness_review: Mapped[str] = mapped_column(String, nullable=False)
     wiki_pages_injected: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # Whether the QA loop actually opened with wiki context. Distinct from
+    # ``wiki_pages_injected``: a super summary alone is context, and is the
+    # common case for a project whose wiki has no separately queryable pages.
+    wiki_context_injected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     created_at: Mapped[str] = mapped_column(String, nullable=False, default=utcnow)
     completed_at: Mapped[str | None] = mapped_column(String, nullable=True)
 

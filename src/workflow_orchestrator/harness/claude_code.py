@@ -70,7 +70,7 @@ class ClaudeCodeAdapter:
             str(worktree),
         ]
 
-        read_only = operation in (HarnessOperation.PLAN, HarnessOperation.REVIEW)
+        read_only = operation.read_only
         if read_only:
             # Plan mode refuses edits outright; the allow-list narrows it further.
             #
@@ -211,4 +211,16 @@ class ClaudeCodeAdapter:
 
         return await run_review_operation(
             self, target=target, worktree=worktree, context_files=context_files
+        )
+
+    async def as_built(
+        self, worktree: Path, context_files: list[Path], merged_diff: Path | None
+    ) -> Path:
+        from .runner import run_as_built_operation
+
+        return await run_as_built_operation(
+            self,
+            worktree=worktree,
+            context_files=context_files,
+            merged_diff=merged_diff,
         )

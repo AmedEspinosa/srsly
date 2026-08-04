@@ -57,10 +57,12 @@ async def test_session_creates_a_worktree(
     worktree = worktree_for(repo, session["id"])
     assert worktree.is_dir()
     assert (worktree / ".workflow").is_dir()
-    # §4.5 — .workflow/ must be ignored so agent scratch never reaches a commit.
-    gitignore = (repo / ".gitignore").read_text(encoding="utf-8")
-    assert ".workflow/" in gitignore
-    assert "worktrees/" in gitignore
+    # §4.5 — the exclusion goes in .git/info/exclude, which the worktree
+    # actually reads, and not in the tracked .gitignore, which it does not.
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert ".workflow/" in exclude
+    assert "worktrees/" in exclude
+    assert not (repo / ".gitignore").exists(), "the user's repo must not be edited"
 
 
 async def test_same_harness_rejected(client: AsyncClient, project: dict) -> None:

@@ -5,6 +5,9 @@
         async def implement(self, plan_file, worktree) -> AsyncIterator[RunEvent]
         async def review(self, target, worktree, context_files) -> Path
 
+``as_built`` extends that surface: it is the same read-only shape as ``review``,
+run after the pull request merges to record what actually shipped.
+
 Both concrete adapters translate their CLI's JSONL event stream into
 :class:`RunEvent`, which is the only shape the supervisor and the SSE layer
 understand.
@@ -24,6 +27,19 @@ class HarnessOperation(str, enum.Enum):
     PLAN = "plan"
     IMPLEMENT = "implement"
     REVIEW = "review"
+    #: Post-merge reconciliation of the SRS against what actually shipped.
+    #: The value is the artifact stem: ``.workflow/as-built.md``.
+    AS_BUILT = "as-built"
+
+    @property
+    def read_only(self) -> bool:
+        """FR-16 — every operation but IMPLEMENT is forbidden to write.
+
+        Lives on the enum rather than in each adapter because both adapters
+        need the same answer, and a per-adapter tuple of read-only operations
+        is a thing you can forget to update when a fourth operation arrives.
+        """
+        return self is not HarnessOperation.IMPLEMENT
 
 
 @dataclass
@@ -113,6 +129,12 @@ class HarnessAdapter(Protocol):
         self, target: Path, worktree: Path, context_files: list[Path]
     ) -> Path:
         """Produce ``.workflow/review.md`` (FR-23/24)."""
+        ...
+
+    async def as_built(
+        self, worktree: Path, context_files: list[Path], merged_diff: Path | None
+    ) -> Path:
+        """Produce ``.workflow/as-built.md`` — what shipped, versus the SRS."""
         ...
 
 

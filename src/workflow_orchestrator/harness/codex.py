@@ -63,7 +63,7 @@ class CodexAdapter:
         prompt: str,
         output_file: Path | None = None,
     ) -> CommandSpec:
-        read_only = operation in (HarnessOperation.PLAN, HarnessOperation.REVIEW)
+        read_only = operation.read_only
         sandbox = SANDBOX_READ_ONLY if read_only else SANDBOX_WORKSPACE_WRITE
 
         argv: list[str] = [
@@ -216,4 +216,16 @@ class CodexAdapter:
 
         return await run_review_operation(
             self, target=target, worktree=worktree, context_files=context_files
+        )
+
+    async def as_built(
+        self, worktree: Path, context_files: list[Path], merged_diff: Path | None
+    ) -> Path:
+        from .runner import run_as_built_operation
+
+        return await run_as_built_operation(
+            self,
+            worktree=worktree,
+            context_files=context_files,
+            merged_diff=merged_diff,
         )

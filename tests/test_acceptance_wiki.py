@@ -53,7 +53,7 @@ async def test_ac6_concurrent_writebacks_do_not_interleave(
     project_id, session_ids = two_sessions
     layout = layout_for(wiki_repo)
 
-    async def fake_ingest(settings_, project_, source: Path) -> list[str]:
+    async def fake_ingest(settings_, project_, source: Path, policy_) -> list[str]:
         """Stand-in for the wiki agent.
 
         Reads index.md, yields to the loop, then writes back. Two of these
@@ -76,6 +76,10 @@ async def test_ac6_concurrent_writebacks_do_not_interleave(
     monkeypatch.setattr(
         "workflow_orchestrator.librarian.lint.run_lint",
         lambda *a, **k: asyncio.sleep(0, result=None),
+    )
+    # As would the as-built run, which is a harness invocation of its own.
+    monkeypatch.setattr(
+        writeback, "generate_as_built", lambda *a, **k: asyncio.sleep(0, result=None)
     )
 
     queue = get_queue()
@@ -147,7 +151,7 @@ async def test_only_the_srs_is_ingested(
 
     ingested: list[str] = []
 
-    async def record(settings_, project_, source: Path) -> list[str]:
+    async def record(settings_, project_, source: Path, policy_) -> list[str]:
         ingested.append(source.name)
         return []
 
@@ -155,6 +159,9 @@ async def test_only_the_srs_is_ingested(
     monkeypatch.setattr(
         "workflow_orchestrator.librarian.lint.run_lint",
         lambda *a, **k: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        writeback, "generate_as_built", lambda *a, **k: asyncio.sleep(0, result=None)
     )
 
     await writeback.run_post_merge(settings, project_id, session_id)

@@ -118,7 +118,7 @@ def test_adapters_are_reached_only_through_the_registry() -> None:
     assert offenders == [], "\n".join(offenders)
 
 
-@pytest.mark.parametrize("operation", ["plan", "implement", "review"])
+@pytest.mark.parametrize("operation", ["plan", "implement", "review", "as_built"])
 def test_both_adapters_implement_the_protocol(operation: str) -> None:
     """§4.4 — both backends expose the same operation surface."""
     from workflow_orchestrator.harness.claude_code import ClaudeCodeAdapter

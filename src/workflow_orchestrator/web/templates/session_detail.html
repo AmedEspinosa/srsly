@@ -40,13 +40,38 @@
 </div>
 {% endif %}
 
+{% if session.current_phase == "completed" %}
+<h2>As-built</h2>
+<div class="card">
+  <p class="meta">
+    Written after the merge by the <strong>{{ session.harness_review }}</strong>
+    harness and ingested into the wiki: every requirement in the SRS, checked
+    against the code that actually shipped. The SRS records what was proposed —
+    this records what exists.
+  </p>
+  <p class="meta" id="as-built-summary">loading…</p>
+  <table id="as-built-table" hidden>
+    <thead>
+      <tr><th>Requirement</th><th>Status</th><th>Where</th><th>Note</th></tr>
+    </thead>
+    <tbody id="as-built-rows"></tbody>
+  </table>
+  <details id="as-built-prose-wrap" hidden>
+    <summary>Full as-built document</summary>
+    <pre class="artifact" id="as-built-prose"></pre>
+  </details>
+</div>
+{% endif %}
+
 {% if session.current_phase == "merge" %}
 <h2>Merge</h2>
 <div class="card">
   <p class="meta">
     Pushes <span class="mono">workflow/{{ session.id }}</span> and opens a pull
-    request linking the SRS, plan and review. Merge state is polled every
-    {{ merge_poll_seconds }}s; the session completes automatically on merge.
+    request. The SRS, plan and review stay out of the commit (§4.5); an as-built
+    record reconciling them against what shipped is produced after the merge.
+    Merge state is polled every {{ merge_poll_seconds }}s; the session completes
+    automatically on merge.
   </p>
   <div class="actions">
     <button class="primary" id="merge-open">Push branch &amp; open PR</button>
@@ -109,11 +134,13 @@
 {% if session.current_phase == "qa" %}
 <h2>Clarifying questions</h2>
 <div class="card" id="qa-panel">
+  <p class="meta" id="qa-context">Checking wiki context…</p>
   <p class="meta" id="qa-round">Loading…</p>
   <div id="qa-questions"></div>
   <div class="actions" id="qa-actions" hidden>
     <button class="primary" id="qa-submit">Submit answers</button>
     <button id="qa-finalize">Skip remaining questions &amp; write the SRS</button>
+    <button id="qa-restart" title="Discard this transcript and ask again with fresh wiki context">Restart with wiki context</button>
   </div>
 </div>
 {% endif %}
@@ -351,6 +378,65 @@ if (mergeButton) {
   });
 }
 
+// ── As-built: what shipped, versus what the SRS proposed ────────────────────
+const asBuiltSummary = document.getElementById("as-built-summary");
+if (asBuiltSummary) {
+  // Dropped and deviated requirements sort first server-side — they are the
+  // reason this panel exists, so they must not be buried under the passes.
+  const BADGES = { dropped: "bad", deviated: "warn", unverified: "warn", implemented: "ok" };
+
+  (async () => {
+    try {
+      const data = await wo.api(`/sessions/${SESSION_ID}/as-built`);
+      if (!data.exists) {
+        asBuiltSummary.textContent =
+          "Not written yet — it is produced by the post-merge write-back.";
+        return;
+      }
+
+      const c = data.counts || {};
+      asBuiltSummary.textContent = data.gaps
+        ? `${data.gaps} of ${data.requirements.length} requirements did not ship as specified `
+          + `— ${c.dropped || 0} dropped, ${c.deviated || 0} deviated, ${c.unverified || 0} unverified.`
+        : `All ${data.requirements.length} requirements implemented as specified.`;
+
+      const rows = document.getElementById("as-built-rows");
+      rows.innerHTML = "";
+      // Built from text nodes rather than innerHTML: every field here is
+      // harness-generated prose.
+      const cell = (tr, text, className) => {
+        const td = document.createElement("td");
+        if (className) td.className = className;
+        td.textContent = text;
+        tr.appendChild(td);
+        return td;
+      };
+      for (const req of data.requirements) {
+        const tr = document.createElement("tr");
+        cell(tr, req.id, "mono");
+
+        const statusCell = cell(tr, "", "");
+        const badge = document.createElement("span");
+        badge.className = `badge ${BADGES[req.status] || ""}`;
+        badge.textContent = req.status;
+        statusCell.appendChild(badge);
+
+        cell(tr, req.location || "—", "mono");
+        cell(tr, req.note || "", "");
+        rows.appendChild(tr);
+      }
+      document.getElementById("as-built-table").hidden = false;
+
+      if (data.content) {
+        document.getElementById("as-built-prose").textContent = data.content;
+        document.getElementById("as-built-prose-wrap").hidden = false;
+      }
+    } catch (err) {
+      asBuiltSummary.textContent = `could not load: ${err.message}`;
+    }
+  })();
+}
+
 // ── Implement phase: detached run + live SSE (FR-18..FR-22) ─────────────────
 const implButton = document.getElementById("impl-run");
 if (implButton) {
@@ -493,9 +579,38 @@ if (planButton) {
 const qaPanel = document.getElementById("qa-panel");
 if (qaPanel) {
   const roundEl = document.getElementById("qa-round");
+  const contextEl = document.getElementById("qa-context");
   const questionsEl = document.getElementById("qa-questions");
   const actionsEl = document.getElementById("qa-actions");
   let currentQuestions = [];
+
+  // Question quality is downstream of the wiki context, so say plainly whether
+  // it made it in. Without this, an unconfigured wiki looks like a bad model.
+  async function showContext() {
+    try {
+      const c = await wo.api(`/sessions/${SESSION_ID}/qa/context`);
+      const parts = [];
+      if (c.super_summary_found) {
+        parts.push(`super summary (${(c.super_summary_chars / 1024).toFixed(1)} KB)`);
+      }
+      if (c.pages.length) parts.push(`${c.pages.length} wiki page(s)`);
+
+      if (c.injected && parts.length) {
+        contextEl.textContent = `Wiki context: ${parts.join(" + ")}`;
+        contextEl.style.color = "";
+      } else if (c.available) {
+        contextEl.textContent =
+          `Wiki context available (${parts.join(" + ")}) but NOT in this transcript` +
+          " — use “Restart with wiki context”.";
+        contextEl.style.color = "var(--warn, #b45309)";
+      } else {
+        contextEl.textContent = `No wiki context. ${c.hint || ""}`;
+        contextEl.style.color = "var(--warn, #b45309)";
+      }
+    } catch (err) {
+      contextEl.textContent = `Wiki context unknown: ${err.message}`;
+    }
+  }
 
   function renderQuestion(question) {
     const wrapper = document.createElement("div");
@@ -630,7 +745,23 @@ if (qaPanel) {
     }
   });
 
-  load();
+  document.getElementById("qa-restart").addEventListener("click", async (event) => {
+    if (!window.confirm("Discard this Q&A transcript and start over with wiki context?")) {
+      return;
+    }
+    event.target.disabled = true;
+    roundEl.textContent = "Retrieving wiki context and asking the first round…";
+    try {
+      render(await wo.api(`/sessions/${SESSION_ID}/qa/restart`, { method: "POST" }));
+      await showContext();
+    } catch (err) {
+      wo.toast(err.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  });
+
+  load().then(showContext);
 }
 
 document.querySelectorAll("[data-artifact]").forEach((button) => {

@@ -38,6 +38,13 @@ def run_migrations_online() -> None:
         # here so the mode is set from the very first write (NFR-5) rather than
         # waiting for the server's first connection.
         connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        # SQLAlchemy 2.0 opens an implicit transaction for that PRAGMA, and
+        # Alembic's own begin_transaction() then nests inside it. SQLite commits
+        # DDL eagerly, so migrations appeared to work — but the alembic_version
+        # write rolled back at close, leaving the table empty and `db migrate`
+        # non-idempotent: the second run re-ran 0001 and died on CREATE TABLE.
+        connection.commit()
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -47,6 +54,7 @@ def run_migrations_online() -> None:
         )
         with context.begin_transaction():
             context.run_migrations()
+        connection.commit()
 
 
 if context.is_offline_mode():

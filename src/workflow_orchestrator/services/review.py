@@ -189,3 +189,44 @@ def set_finding_status(
 
 def outstanding(findings: list[Finding]) -> list[Finding]:
     return [f for f in findings if f.status in (STATUS_OPEN, STATUS_FIXING)]
+
+
+#: Run statuses that mean the follow-up never delivered its fix.
+_FIX_FAILED = ("failed", "timed_out", "cost_exceeded")
+
+
+async def reconcile_fixing(db: object, worktree: Path, findings: list[Finding]) -> bool:
+    """Advance ``fixing`` findings once their follow-up run has finished.
+
+    ``fix_finding`` marks a finding ``fixing`` and hands it to the supervisor,
+    but nothing ever came back to close the loop: ``STATUS_FIXED`` existed and
+    was never assigned, so findings sat at ``fixing`` forever, ``outstanding()``
+    never decreased, and no consumer could tell a resolved finding from an
+    abandoned one.
+
+    Reconciling lazily from the run row — rather than having the supervisor call
+    back into review triage — keeps runs unaware of findings, and means a run
+    that finished while the process was down is still picked up on the next read.
+
+    A completed run is evidence the fix was *attempted to completion*, not that
+    it was correct; the re-review is what judges that. A failed, timed-out or
+    cost-exceeded run reopens the finding, because that fix did not land.
+    """
+    from ..models import Run  # local: services.review must stay import-light
+
+    changed = False
+    for finding in findings:
+        if finding.status != STATUS_FIXING or not finding.run_id:
+            continue
+        run = await db.get(Run, finding.run_id)  # type: ignore[attr-defined]
+        if run is None or run.ended_at is None:
+            continue
+        if run.status == "completed":
+            finding.status = STATUS_FIXED
+        elif run.status in _FIX_FAILED:
+            finding.status = STATUS_OPEN
+        else:
+            continue
+        set_finding_status(worktree, finding.id, finding.status, run_id=finding.run_id)
+        changed = True
+    return changed

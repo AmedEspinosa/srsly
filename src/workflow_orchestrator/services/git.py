@@ -1,8 +1,10 @@
 """Git and GitHub integration — SRS FR-27, FR-28, FR-29, §4.5.
 
 Worktrees live at ``<repo_root>/worktrees/<session_id>``; each carries a
-``.workflow/`` directory holding the session's artifacts. ``.workflow/`` is
-added to the repo's ``.gitignore`` so agent scratch never lands in a commit.
+``.workflow/`` directory holding the session's artifacts. Those artifacts are
+kept out of commits two ways — see ``ensure_scratch_excluded`` and
+``commit_all`` — because the SRS, plan, review and run logs belong to the wiki,
+not to the pull request.
 """
 
 from __future__ import annotations
@@ -83,19 +85,46 @@ class GitService:
 
     # --- worktrees ------------------------------------------------------------
 
-    async def ensure_gitignore(self, repo_path: Path | str) -> None:
-        """Append ``.workflow/`` and ``worktrees/`` to .gitignore if absent (§4.5)."""
-        gitignore = Path(repo_path) / ".gitignore"
-        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    async def ensure_scratch_excluded(self, repo_path: Path | str) -> None:
+        """Ignore ``.workflow/`` and ``worktrees/`` via ``.git/info/exclude`` (§4.5).
+
+        Not ``.gitignore``. That file is tracked, so writing to it (a) modifies
+        the user's repository as a side effect of creating a session and (b) has
+        no effect where it matters: ``git worktree add --detach <ref>`` checks
+        out a commit, and an uncommitted ``.gitignore`` edit is not in it. The
+        rule was written to a file the worktree would never read, which is how
+        14 scratch files reached a pull request.
+
+        ``info/exclude`` resolves to the *common* git dir, so one write covers
+        every worktree of the repo, and it is never committed.
+        """
+        repo = Path(repo_path)
+        result = await run_command(
+            [self._git, "rev-parse", "--git-path", "info/exclude"], cwd=repo
+        )
+        if not result.ok:
+            log.warning("exclude.unresolved", repo_path=str(repo))
+            return
+        # Relative when run from the repo root, absolute inside a worktree.
+        exclude = Path(result.stdout.strip())
+        if not exclude.is_absolute():
+            exclude = repo / exclude
+
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         lines = {line.strip() for line in existing.splitlines()}
-        additions = [entry for entry in (f"{WORKFLOW_DIR}/", f"{WORKTREES_DIR}/") if entry not in lines]
+        additions = [
+            entry
+            for entry in (f"{WORKFLOW_DIR}/", f"{WORKTREES_DIR}/")
+            if entry not in lines
+        ]
         if not additions:
             return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
         prefix = "" if existing.endswith("\n") or not existing else "\n"
-        gitignore.write_text(
+        exclude.write_text(
             existing + prefix + "\n".join(additions) + "\n", encoding="utf-8"
         )
-        log.info("gitignore.updated", repo_path=str(repo_path), added=additions)
+        log.info("exclude.updated", path=str(exclude), added=additions)
 
     async def create_worktree(
         self, repo_path: Path | str, session_id: str, *, base: str | None = None
@@ -110,7 +139,7 @@ class GitService:
         if target.exists():
             return target
 
-        await self.ensure_gitignore(repo)
+        await self.ensure_scratch_excluded(repo)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         ref = base or "HEAD"
@@ -188,8 +217,18 @@ class GitService:
         return result.stdout + ("\n" + extra if extra else "")
 
     async def commit_all(self, worktree: Path | str, message: str) -> bool:
-        """Stage and commit everything. Returns False when there was nothing to do."""
-        await run_command([self._git, "add", "-A"], cwd=worktree)
+        """Stage and commit the work, never the scratch.
+
+        The ``.workflow/`` exclusion is a pathspec rather than a reliance on
+        ignore rules: this runs against repositories we do not control, and an
+        ignore file that is missing, overridden, or checked out from an older
+        commit must not be able to leak the SRS, plan, review and run logs into
+        a pull request. Returns False when there was nothing to commit.
+        """
+        await run_command(
+            [self._git, "add", "-A", "--", ".", f":(exclude){WORKFLOW_DIR}"],
+            cwd=worktree,
+        )
         staged = await run_command([self._git, "diff", "--cached", "--quiet"], cwd=worktree)
         if staged.returncode == 0:
             return False
@@ -251,6 +290,47 @@ class GitService:
             url=str(payload.get("url") or ""),
             state=str(payload.get("state") or "UNKNOWN"),
         )
+
+    async def pull_request_diff(
+        self, worktree: Path | str, number: int
+    ) -> str | None:
+        """``gh pr diff`` — what the pull request actually landed.
+
+        Authoritative in a way the local branch is not: it survives squash
+        merges, maintainer edits and commits pushed to the PR after we last
+        looked. Returns None rather than raising — an as-built record derived
+        from the code alone is still worth more than no record.
+        """
+        result = await run_command(
+            [self._gh, "pr", "diff", str(number)], cwd=worktree, timeout=180.0
+        )
+        if not result.ok:
+            log.warning(
+                "gh.pr_diff_failed",
+                number=number,
+                error=(result.stderr or result.stdout).strip()[-300:],
+            )
+            return None
+        return result.stdout
+
+    async def comment_on_pull_request(
+        self, worktree: Path | str, number: int, body: str
+    ) -> bool:
+        """``gh pr comment``. Returns False on failure rather than raising."""
+        result = await run_command(
+            [self._gh, "pr", "comment", str(number), "--body", body],
+            cwd=worktree,
+            timeout=120.0,
+        )
+        if not result.ok:
+            log.warning(
+                "gh.pr_comment_failed",
+                number=number,
+                error=(result.stderr or result.stdout).strip()[-300:],
+            )
+            return False
+        log.info("gh.pr_commented", number=number)
+        return True
 
     async def gh_available(self) -> bool:
         try:

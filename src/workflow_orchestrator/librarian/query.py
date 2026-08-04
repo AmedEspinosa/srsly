@@ -78,7 +78,12 @@ async def query_pages(
     if not layout.is_initialized():
         return []
 
-    prompt = QUERY_INSTRUCTION.format(question=question.strip(), root=WIKI_ROOT)
+    # Show the example paths at the prefix this vault actually uses, so the
+    # agent emits paths that resolve instead of ones shaped like the SRS's
+    # canonical layout.
+    prompt = QUERY_INSTRUCTION.format(
+        question=question.strip(), root=layout.pages_prefix
+    )
     argv = [
         settings.WORKFLOW_CODEX_BIN,
         "exec",

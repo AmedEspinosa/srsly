@@ -8,9 +8,17 @@ spread through the ingest logic:
 |---------------------------------------------|---------------------------|
 | ``.workflow/srs.md``                         | Ingest via ``wiki-ingest``|
 | Architectural decisions extracted from srs   | Ingest via ``wiki-ingest``|
+| ``.workflow/as-built.md``                    | Ingest — generated here   |
 | ``.workflow/plan.md``                        | Do not ingest — transient |
 | ``.workflow/review.md``                      | Do not ingest             |
 | Session transcripts / run logs               | Never ingest              |
+
+``as-built.md`` extends §2.11 rather than following it. The table as written
+ingests only the SRS, which is a statement of what was *proposed* — so the wiki
+recorded intentions as facts, and a later session asking about a requirement
+that was quietly dropped would be told it exists. This module now generates the
+as-built record first (:func:`generate_as_built`) and ingests it second, so the
+result corrects the proposal instead of the other way round.
 
 Every write goes through the serialised queue (FR-42), every page it creates or
 modifies is flagged ``needs_review: true`` (FR-39), and a super-summary
@@ -38,19 +46,49 @@ log = get_logger(__name__)
 INGEST_TIMEOUT_SECONDS = 900.0
 
 
+SPEC_FRAMING = """\
+This source is a software requirements specification produced by an automated \
+development workflow. It records what was *proposed*. Extract the durable \
+knowledge from it — architectural decisions, interfaces, constraints and their \
+rationale — rather than transcribing the document."""
+
+AS_BUILT_FRAMING = """\
+This source is an as-built record produced after the change merged. It states, \
+per requirement, what was actually implemented, what deviated from the \
+specification, and what was dropped outright.
+
+Where it contradicts a specification page already in the wiki, **this document \
+wins** — the specification described an intention and this describes the result. \
+Record dropped and deviated requirements explicitly. A reader who is told a \
+feature exists when it does not is worse off than one told nothing."""
+
+
 @dataclass(frozen=True)
 class ArtifactPolicy:
     relative: str
     ingest: bool
     reason: str
+    #: How the Librarian is told to read this artifact. Without it every source
+    #: would be introduced as a specification, and an as-built record read as a
+    #: specification is extracted as though its deviations were requirements.
+    framing: str = SPEC_FRAMING
 
 
-#: SRS §2.11 selection table. Order is the order artifacts are considered.
+#: SRS §2.11 selection table. Order is the order artifacts are considered — and,
+#: for ingest, the order they are written. ``as-built.md`` follows ``srs.md`` so
+#: it corrects the record rather than being corrected by it.
 SELECTION_TABLE: tuple[ArtifactPolicy, ...] = (
     ArtifactPolicy(".workflow/srs.md", True, "specification is durable context"),
+    ArtifactPolicy(
+        ".workflow/as-built.md",
+        True,
+        "what actually shipped — the wiki must not record intentions as facts",
+        framing=AS_BUILT_FRAMING,
+    ),
     ArtifactPolicy(".workflow/plan.md", False, "transient"),
-    ArtifactPolicy(".workflow/review.md", False, "not ingested"),
+    ArtifactPolicy(".workflow/review.md", False, "pre-fix defect list; superseded by as-built"),
     ArtifactPolicy(".workflow/diff.patch", False, "implementation detail"),
+    ArtifactPolicy(".workflow/merged.diff", False, "input to as-built, not a source"),
     ArtifactPolicy(".workflow/pr.json", False, "not ingested"),
 )
 
@@ -79,9 +117,10 @@ def should_ingest(relative_path: str) -> bool:
     return False
 
 
-def ingestible_artifacts(worktree: Path) -> list[Path]:
+def ingestible_artifacts(worktree: Path) -> list[tuple[Path, ArtifactPolicy]]:
+    """Sources to ingest, each paired with the policy that frames it."""
     return [
-        worktree / policy.relative
+        (worktree / policy.relative, policy)
         for policy in SELECTION_TABLE
         if policy.ingest and (worktree / policy.relative).exists()
     ]
@@ -170,10 +209,7 @@ wiki-ingest: {path}
 
 Follow the ingest procedure in llm-wiki/schema.md.
 
-This source is a software requirements specification produced by an automated \
-development workflow. Extract the durable knowledge from it — architectural \
-decisions, interfaces, constraints and their rationale — rather than transcribing \
-the document.
+{framing}
 
 Every page you create or modify MUST carry `needs_review: true` in its \
 frontmatter, because this write was automated and a human has not yet checked it.
@@ -209,9 +245,13 @@ def parse_written_pages(output: str, *, root: str = WIKI_ROOT) -> list[str]:
     return pages
 
 
-async def _ingest_one(settings: Settings, project: Project, source: Path) -> list[str]:
+async def _ingest_one(
+    settings: Settings, project: Project, source: Path, policy: ArtifactPolicy
+) -> list[str]:
     layout = layout_for(project.wiki_repo_path)
-    prompt = INGEST_INSTRUCTION.format(path=source, root=WIKI_ROOT)
+    prompt = INGEST_INSTRUCTION.format(
+        path=source, root=WIKI_ROOT, framing=policy.framing
+    )
 
     argv = [
         settings.WORKFLOW_CODEX_BIN,
@@ -316,6 +356,87 @@ async def _propose_super_summary(
     )
 
 
+# --- as-built ------------------------------------------------------------------
+
+AS_BUILT_RELATIVE = ".workflow/as-built.md"
+MERGED_DIFF_RELATIVE = ".workflow/merged.diff"
+
+
+async def generate_as_built(settings: Settings, session: Session, worktree: Path) -> Path | None:
+    """Reconcile the SRS against what actually shipped — post-merge only.
+
+    Post-merge is the only point at which this document can be true. Fixes land
+    during pull-request review, maintainers amend, and a squash rewrites the
+    branch entirely; a record written when the PR opened would describe a state
+    that no longer exists.
+
+    The *reviewing* harness runs it, for FR-23's reason: the harness that wrote
+    the code is the wrong one to certify what the code does.
+
+    Every failure path returns None and logs. The write-back must still ingest
+    the specification if this cannot run — a wiki with the SRS alone is what we
+    have today, and losing that too would make the feature a regression.
+    """
+    from ..harness import get_adapter
+    from ..harness.runner import HarnessError
+    from ..models import Harness
+    from ..services.git import GitService
+
+    srs = worktree / ".workflow" / "srs.md"
+    if not srs.exists():
+        log.warning("wiki.as_built_skipped", reason="no srs.md", session_id=session.id)
+        return None
+
+    # What actually landed, which the local branch may no longer match.
+    merged_diff: Path | None = None
+    if session.pr_number:
+        diff_text = await GitService(settings).pull_request_diff(
+            worktree, session.pr_number
+        )
+        if diff_text:
+            merged_diff = worktree / MERGED_DIFF_RELATIVE
+            merged_diff.parent.mkdir(parents=True, exist_ok=True)
+            merged_diff.write_text(diff_text, encoding="utf-8")
+
+    adapter = get_adapter(Harness(session.harness_review), settings)
+    context = [
+        srs,
+        worktree / ".workflow" / "plan.md",
+        worktree / ".workflow" / "review.md",
+    ]
+    try:
+        artifact = await adapter.as_built(worktree, context, merged_diff)
+    except (HarnessError, OSError, FileNotFoundError) as exc:
+        log.warning("wiki.as_built_failed", session_id=session.id, error=str(exc))
+        return None
+
+    log.info(
+        "wiki.as_built_written",
+        session_id=session.id,
+        artifact=str(artifact),
+        harness=session.harness_review,
+        merged_diff=str(merged_diff) if merged_diff else None,
+    )
+    await _post_as_built_comment(settings, session, worktree, artifact)
+    return artifact
+
+
+async def _post_as_built_comment(
+    settings: Settings, session: Session, worktree: Path, artifact: Path
+) -> None:
+    """Optionally attach the record to the merged PR. Off by default.
+
+    Publishing to GitHub is outward-facing, so it stays opt-in: the wiki is the
+    intended home for this document and posting is a convenience on top.
+    """
+    if not settings.WORKFLOW_POST_AS_BUILT_COMMENT or not session.pr_number:
+        return
+    from ..services.git import GitService
+
+    body = artifact.read_text(encoding="utf-8", errors="replace")
+    await GitService(settings).comment_on_pull_request(worktree, session.pr_number, body)
+
+
 async def run_post_merge(settings: Settings, project_id: str, session_id: str) -> list[str]:
     """The actual write-back. Always invoked from inside the queue (FR-42)."""
     async with session_scope() as db:
@@ -336,10 +457,15 @@ async def run_post_merge(settings: Settings, project_id: str, session_id: str) -
     from ..services.workflow import session_worktree
 
     worktree = session_worktree(project, session)
+
+    # Produce the as-built record *before* deciding what to ingest, so the run's
+    # output is picked up by the selection table below rather than next time.
+    await generate_as_built(settings, session, worktree)
+
     written: list[str] = []
 
-    for source in ingestible_artifacts(worktree):
-        pages = await _ingest_one(settings, project, source)
+    for source, policy in ingestible_artifacts(worktree):
+        pages = await _ingest_one(settings, project, source, policy)
         written.extend(pages)
         log.info(
             "wiki.ingested", source=str(source), pages=len(pages), session_id=session_id

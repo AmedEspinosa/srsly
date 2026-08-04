@@ -29,26 +29,28 @@ PR_BODY_TEMPLATE = """\
 
 Produced by the AI-driven development workflow orchestrator.
 
-| Artifact | Path |
-| --- | --- |
-| Specification | `{srs}` |
-| Plan | `{plan}` |
-| Review | `{review}` |
-
 - Implemented by: **{harness_implement}**
 - Reviewed by: **{harness_review}**
+
+The specification, plan and review for this change are session artifacts held \
+outside the repository, under `worktrees/{session_id}/`. An as-built record \
+reconciling the specification against what actually shipped is produced after \
+this pull request merges.
 
 Session `{session_id}`.
 """
 
 
 def build_pr_body(session: Session) -> str:
-    """FR-28 — body links srs.md, plan.md and review.md."""
+    """FR-28 — attribute the change and point at where its artifacts live.
+
+    The body used to carry a table of `.workflow/` paths. Those artifacts are no
+    longer committed (SRS §4.5 — session scratch does not belong in a pull
+    request), so the table linked three paths that did not exist. Naming the
+    worktree is honest; a dead link is not.
+    """
     return PR_BODY_TEMPLATE.format(
         summary=session.feature_prompt.strip(),
-        srs=".workflow/srs.md",
-        plan=".workflow/plan.md",
-        review=".workflow/review.md",
         harness_implement=session.harness_implement,
         harness_review=session.harness_review,
         session_id=session.id,
@@ -117,6 +119,33 @@ async def open_pull_request(
 
     log.info("merge.pr_opened", session_id=session.id, url=pr.url, number=pr.number)
     return {"url": pr.url, "number": pr.number, "state": pr.state, "branch": branch}
+
+
+@router.get("/sessions/{session_id}/as-built")
+async def read_as_built(db: DbSession, session: CurrentSession) -> dict[str, object]:
+    """The post-merge record: what shipped, and where it left the SRS behind.
+
+    Written by the write-back, so it only exists once the pull request has
+    merged. Absent is a normal state, not an error.
+    """
+    from ..services import as_built as as_built_service
+
+    project = await workflow.get_project(db, session.project_id)
+    if project is None:  # pragma: no cover
+        raise HTTPException(status_code=404, detail="project not found")
+
+    worktree = workflow.session_worktree(project, session)
+    document = as_built_service.read(worktree)
+    if document is None:
+        return {"exists": False, "requirements": [], "content": "", "counts": {}}
+
+    return {
+        "exists": True,
+        "content": document.prose,
+        "requirements": [r.to_dict() for r in document.requirements],
+        "counts": document.counts(),
+        "gaps": len(document.gaps),
+    }
 
 
 @router.get("/sessions/{session_id}/merge/status")

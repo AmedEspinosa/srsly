@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..models import Phase
-from ..schemas import QaQuestion, QaState, QaSubmit
+from sqlalchemy import delete
+
+from ..models import Phase, QaTurn
+from ..schemas import QaQuestion, QaState, QaSubmit, WikiContextStatus
 from ..services import workflow
 from ..services.bedrock import BedrockError
 from ..services.requirements import QaState as EngineState
@@ -60,18 +62,46 @@ async def get_qa_state(
     return _to_schema(await engine.state(db, project, session))
 
 
-@router.post("/sessions/{session_id}/qa/start", response_model=QaState)
-async def start_qa(
-    request: Request, db: DbSession, settings: AppSettings, session: CurrentSession
-) -> QaState:
-    _require_qa_phase(session)
+@router.get("/sessions/{session_id}/qa/context", response_model=WikiContextStatus)
+async def get_qa_context(db: DbSession, session: CurrentSession) -> WikiContextStatus:
+    """What wiki context this session has, or why it has none.
+
+    Without this the QA phase fails soft and invisibly: a mis-levelled
+    ``wiki_repo_path`` yields an empty context, and the only symptom is that the
+    model asks generic questions.
+    """
     project = await _project_for(db, session)
+    from ..librarian.retrieval import inspect_context
+
+    status = inspect_context(project)
+    return WikiContextStatus(
+        injected=bool(session.wiki_context_injected),
+        available=status.has_context,
+        initialized=status.initialized,
+        wiki_repo_path=status.wiki_repo_path,
+        resolved_wiki_dir=status.resolved_wiki_dir,
+        super_summary_path=status.super_summary_path,
+        super_summary_found=status.super_summary_found,
+        super_summary_chars=status.super_summary_chars,
+        pages=workflow.get_wiki_pages(session),
+        hint=status.hint,
+    )
+
+
+async def _start(
+    request: Request,
+    db: DbSession,
+    settings: AppSettings,
+    project,
+    session: CurrentSession,
+) -> QaState:
     engine = get_engine(request, settings)
 
     # FR-35/FR-36 — inject wiki context before the first question round.
     from ..librarian.retrieval import build_session_context
 
-    context = await build_session_context(db, settings, project, session)
+    context, status = await build_session_context(db, settings, project, session)
+    session.wiki_context_injected = status.has_context
     try:
         state = await engine.start(db, project, session, context=context)
     except BedrockError as exc:
@@ -82,6 +112,33 @@ async def start_qa(
     # too, not only on the answer path (FR-12).
     await workflow.advance_qa_if_srs_ready(db, project, session)
     return _to_schema(state)
+
+
+@router.post("/sessions/{session_id}/qa/start", response_model=QaState)
+async def start_qa(
+    request: Request, db: DbSession, settings: AppSettings, session: CurrentSession
+) -> QaState:
+    _require_qa_phase(session)
+    project = await _project_for(db, session)
+    return await _start(request, db, settings, project, session)
+
+
+@router.post("/sessions/{session_id}/qa/restart", response_model=QaState)
+async def restart_qa(
+    request: Request, db: DbSession, settings: AppSettings, session: CurrentSession
+) -> QaState:
+    """Discard the transcript and re-open the loop with fresh wiki context.
+
+    Context is only injectable at round 0, so a session that opened without it
+    cannot be repaired in place — a session started against a misconfigured
+    wiki would otherwise be stuck with generic questions for its whole life.
+    """
+    _require_qa_phase(session)
+    project = await _project_for(db, session)
+
+    await db.execute(delete(QaTurn).where(QaTurn.session_id == session.id))
+    await db.flush()
+    return await _start(request, db, settings, project, session)
 
 
 @router.post("/sessions/{session_id}/qa/answer", response_model=QaState)

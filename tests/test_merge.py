@@ -83,21 +83,41 @@ def test_pr_title_handles_empty_prompt() -> None:
     assert pr_title_from_prompt("   ") == "Workflow session"
 
 
-def test_pr_body_links_all_three_artifacts() -> None:
-    """FR-28 / AC-10 — body contains links to srs.md, plan.md and review.md."""
+class FakeSession:
+    id = "sess-1"
+    feature_prompt = "Add rate limiting"
+    harness_implement = "claude_code"
+    harness_review = "codex"
 
-    class FakeSession:
-        id = "sess-1"
-        feature_prompt = "Add rate limiting"
-        harness_implement = "claude_code"
-        harness_review = "codex"
 
+def test_pr_body_does_not_link_uncommitted_artifacts() -> None:
+    """Deliberate FR-28 deviation.
+
+    FR-28 says the body links ``srs.md``, ``plan.md`` and ``review.md``. It was
+    written assuming those files are in the repository. §4.5 says the opposite —
+    session scratch must never reach a commit — and once that was actually
+    enforced, the three links pointed at paths that do not exist. PR #49 shipped
+    with exactly that table.
+
+    A requirement cannot be met by emitting a link that 404s, so the body names
+    where the artifacts really live instead. This is the kind of gap the
+    post-merge as-built record exists to write down.
+    """
     body = build_pr_body(FakeSession())  # type: ignore[arg-type]
-    assert ".workflow/srs.md" in body
-    assert ".workflow/plan.md" in body
-    assert ".workflow/review.md" in body
+
+    assert ".workflow/" not in body, "the body must not link uncommitted scratch"
     assert "Add rate limiting" in body
     assert "sess-1" in body
+    # The reader still needs to know the artifacts exist and where to find them.
+    assert "worktrees/sess-1" in body
+    assert "as-built" in body
+
+
+def test_pr_body_attributes_both_harnesses() -> None:
+    """FR-28 — the reviewer must be able to see which backend did what."""
+    body = build_pr_body(FakeSession())  # type: ignore[arg-type]
+    assert "claude_code" in body
+    assert "codex" in body
 
 
 # --- FR-29/FR-30: merge detection ----------------------------------------------

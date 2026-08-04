@@ -94,6 +94,49 @@ SRS §4.5 with page directories directly under `llm-wiki/`. Scaffold one with:
 uv run workflow-orchestrator wiki init /path/to/wiki --seed-from /path/to/existing/vault
 ```
 
+An existing vault that nests its page directories under `llm-wiki/wiki/` is read
+as-is — the layout is detected, not assumed (SRS §1.2 still forbids migrating
+it). `wiki_repo_path` may point at the repo root, at `llm-wiki/`, or at the
+nested page directory; all three resolve to the same repo.
+
+**The QA phase is only as good as this context.** A super summary that does not
+resolve costs nothing visible — the model simply asks generic questions. Check
+it before starting a session:
+
+```bash
+curl -s localhost:8000/sessions/<id>/qa/context | python -m json.tool
+```
+
+`injected: false` with `available: true` means the loop opened without context;
+**Restart with wiki context** in the QA panel discards the transcript and
+re-opens it (context can only be injected at round 0).
+
+### The as-built record
+
+The SRS states what was *proposed*. Ingesting only that leaves the wiki
+recording intentions as facts — a session that drops a requirement leaves no
+trace, and the next one is told the feature exists.
+
+So after a pull request merges, the write-back runs the **reviewing** harness
+once more (FR-23's reasoning: the harness that wrote the code is the wrong one
+to certify it) to produce `.workflow/as-built.md`: every `FR-N`/`NFR-N`/`AC-N`
+marked `implemented`, `deviated`, `dropped` or `unverified`, each with the
+`file:line` where it lives. That document is ingested *after* `srs.md`, framed
+so the Librarian knows it supersedes the specification where the two disagree.
+
+Post-merge is the only honest moment. Fixes land during PR review, maintainers
+amend, and a squash rewrites the branch — a record written when the PR opened
+describes a state that no longer exists. Ground truth is `gh pr diff`, not the
+local branch.
+
+`review.md` is deliberately **not** ingested. It is written before the fix runs
+it triggers, so it asserts bugs that were already repaired.
+
+The panel on a completed session lists dropped and deviated requirements first;
+`GET /sessions/<id>/as-built` returns the same data. Set
+`WORKFLOW_POST_AS_BUILT_COMMENT=true` to also mirror the record onto the merged
+PR — off by default, because it publishes to GitHub.
+
 ## Tests
 
 ```bash
@@ -126,6 +169,21 @@ uv run pytest -m acceptance  # SRS §7 criteria only
 - **Detached implement run** → 3.5 minutes, 14,096 tokens, $1.22, producing
   working code that cited the `FR-N` identifiers from the generated SRS. Meters,
   the run log and the diff endpoint all behaved.
+
+### Session scratch never reaches a commit (§4.5)
+
+`.workflow/` holds the SRS, plan, review, diff and run logs. Those are wiki
+input, not pull-request content, and two independent guards keep them out:
+
+1. `.workflow/` and `worktrees/` are written to **`.git/info/exclude`**, not to
+   `.gitignore`. `.gitignore` is tracked, so editing it would modify the target
+   repository just because a session was created — and it would not even work:
+   `git worktree add --detach <ref>` checks out a commit, and an uncommitted
+   `.gitignore` edit is not in one. `info/exclude` resolves to the shared git
+   dir, so one write covers every worktree and is never committed.
+2. `commit_all` stages with `git add -A -- . ':(exclude).workflow'`. The
+   pathspec holds even in a repository whose ignore rules are missing,
+   overridden by a `!` rule, or checked out from an older commit.
 
 Not verified live: the Docker sandbox (daemon unavailable — see above) and
 `gh pr create` / merge polling against a real GitHub remote.

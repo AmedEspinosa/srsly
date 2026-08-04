@@ -160,6 +160,25 @@ class QaState(BaseModel):
     awaiting_first_prompt: bool = False
 
 
+class WikiContextStatus(BaseModel):
+    """Whether the QA phase got wiki context, and if not, why not.
+
+    Reported so a mis-levelled ``wiki_repo_path`` presents as a configuration
+    error rather than as poor question quality.
+    """
+
+    injected: bool = False
+    available: bool = False
+    initialized: bool = False
+    wiki_repo_path: str
+    resolved_wiki_dir: str
+    super_summary_path: str
+    super_summary_found: bool = False
+    super_summary_chars: int = 0
+    pages: list[str] = Field(default_factory=list)
+    hint: str | None = None
+
+
 class WikiReviewItem(BaseModel):
     page_path: str
     operation: str

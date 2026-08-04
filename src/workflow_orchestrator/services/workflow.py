@@ -100,7 +100,7 @@ async def create_project(
     )
     db.add(project)
     await db.flush()
-    await git.ensure_gitignore(repo_path)
+    await git.ensure_scratch_excluded(repo_path)
     log.info("project.created", project_id=project.id, name=project.name)
     return project
 

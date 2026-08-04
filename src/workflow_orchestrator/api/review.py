@@ -105,6 +105,9 @@ async def list_findings(
 
     text = review_path.read_text(encoding="utf-8", errors="replace")
     findings = review_service.findings_with_triage(worktree, text)
+    # Close the loop on any follow-up run that has finished since the last read;
+    # without this the outstanding count never falls.
+    await review_service.reconcile_fixing(db, worktree, findings)
     return {
         "exists": True,
         "content": review_service.parse_review(text).prose,

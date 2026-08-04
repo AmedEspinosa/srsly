@@ -11,16 +11,31 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 
 from ..logging import get_logger
 from .base import CommandSpec, HarnessOperation, RunEvent
-from .prompts import plan_prompt, review_prompt
+from .lines import LineBuffer
+from .prompts import as_built_prompt, plan_prompt, review_prompt
 
 log = get_logger(__name__)
 
 WORKFLOW_DIR = ".workflow"
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
+
+#: Bytes pulled from the pipe per read. Lines are reassembled by LineBuffer, so
+#: this is a throughput knob, not a limit on line length.
+READ_CHUNK_BYTES = 64 * 1024
+
+#: StreamReader buffer size. Only ``readline``/``readuntil`` enforce it as a
+#: hard limit and this module uses neither, but raising it above the 64 KiB
+#: default keeps the transport from pausing and resuming on every long line.
+STREAM_LIMIT_BYTES = 1024 * 1024
+
+#: Only ``stderr.strip()[-800:]`` is ever reported, so there is no reason to
+#: hold a failing process's entire error output in memory.
+MAX_STDERR_BYTES = 64 * 1024
 
 
 class HarnessError(RuntimeError):
@@ -41,7 +56,14 @@ class SourceModified(HarnessError):
 async def stream_command(
     spec: CommandSpec, adapter: object, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
 ) -> AsyncIterator[RunEvent]:
-    """Run ``spec`` and yield translated events as they arrive."""
+    """Run ``spec`` and yield translated events as they arrive.
+
+    Reads fixed-size chunks rather than iterating the stream. Iteration calls
+    ``readline()``, which raises ``ValueError`` once a line exceeds the reader's
+    ``limit`` — and these CLIs emit lines megabytes long, because the JSONL
+    stream carries whole tool payloads inline. That killed the first plan run
+    against a real repository.
+    """
     env = {**os.environ, **spec.env}
     process = await asyncio.create_subprocess_exec(
         *spec.argv,
@@ -50,6 +72,7 @@ async def stream_command(
         stdin=asyncio.subprocess.PIPE if spec.stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT_BYTES,
     )
 
     if spec.stdin is not None and process.stdin is not None:
@@ -59,19 +82,32 @@ async def stream_command(
         process.stdin.close()
 
     assert process.stdout is not None
-    stderr_chunks: list[bytes] = []
+    stderr_tail = bytearray()
 
     async def drain_stderr() -> None:
         assert process.stderr is not None
-        async for chunk in process.stderr:
-            stderr_chunks.append(chunk)
+        while chunk := await process.stderr.read(READ_CHUNK_BYTES):
+            stderr_tail.extend(chunk)
+            if len(stderr_tail) > MAX_STDERR_BYTES:
+                del stderr_tail[:-MAX_STDERR_BYTES]
 
     stderr_task = asyncio.create_task(drain_stderr())
+    buffer = LineBuffer()
+
+    def _translate(line: str) -> RunEvent | None:
+        return adapter.parse_line(line)  # type: ignore[attr-defined]
 
     try:
         async with asyncio.timeout(timeout):
-            async for raw in process.stdout:
-                event = adapter.parse_line(raw.decode("utf-8", errors="replace"))  # type: ignore[attr-defined]
+            while chunk := await process.stdout.read(READ_CHUNK_BYTES):
+                for line in buffer.feed(chunk):
+                    event = _translate(line)
+                    if event is not None:
+                        yield event
+            # A CLI that omits the final newline still has one event to give.
+            trailing = buffer.flush()
+            if trailing is not None:
+                event = _translate(trailing)
                 if event is not None:
                     yield event
             await process.wait()
@@ -79,11 +115,19 @@ async def stream_command(
         process.kill()
         await process.wait()
         raise
+    except (ValueError, OSError) as exc:
+        # Stream-level failures must reach the API as a harness error, not as an
+        # unhandled 500 — /plan/run only catches HarnessError.
+        process.kill()
+        await process.wait()
+        raise HarnessError(f"{spec.argv[0]} output could not be read: {exc}") from exc
     finally:
         stderr_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stderr_task
 
     if process.returncode != 0:
-        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        stderr = bytes(stderr_tail).decode("utf-8", errors="replace")
         raise HarnessError(
             f"{spec.argv[0]} exited {process.returncode}: {stderr.strip()[-800:]}"
         )
@@ -205,6 +249,58 @@ async def run_review_operation(
         "harness.review_complete",
         harness=getattr(adapter, "name", "unknown"),
         artifact=str(result),
+    )
+    return result
+
+
+async def run_as_built_operation(
+    adapter: object,
+    *,
+    worktree: Path,
+    context_files: list[Path],
+    merged_diff: Path | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Path:
+    """Produce ``.workflow/as-built.md`` after the pull request merges.
+
+    Read-only like the plan and review operations, and held to the same FR-16
+    assertion: reconciling the record must not quietly edit the thing it is
+    reconciling.
+    """
+    from ..services.review import TRIAGE_FILENAME
+
+    srs = context_files[0] if context_files else worktree / WORKFLOW_DIR / "srs.md"
+    plan = context_files[1] if len(context_files) > 1 else worktree / WORKFLOW_DIR / "plan.md"
+    review = (
+        context_files[2] if len(context_files) > 2 else worktree / WORKFLOW_DIR / "review.md"
+    )
+    triage = worktree / WORKFLOW_DIR / TRIAGE_FILENAME
+
+    artifact = worktree / WORKFLOW_DIR / f"{HarnessOperation.AS_BUILT.value}.md"
+    scratch = worktree / WORKFLOW_DIR / ".as-built-last-message.txt"
+
+    spec = adapter.command(  # type: ignore[attr-defined]
+        HarnessOperation.AS_BUILT,
+        worktree=worktree,
+        prompt=as_built_prompt(
+            srs, plan, review, triage=str(triage), merged_diff=merged_diff
+        ),
+        output_file=scratch,
+    )
+
+    events = await collect(spec, adapter, timeout=timeout)
+
+    offenders = await changed_outside_workflow(worktree)
+    if offenders:
+        raise SourceModified(offenders)
+
+    result = await _write_artifact(spec, adapter, events, artifact)
+    scratch.unlink(missing_ok=True)
+    log.info(
+        "harness.as_built_complete",
+        harness=getattr(adapter, "name", "unknown"),
+        artifact=str(result),
+        events=len(events),
     )
     return result
 

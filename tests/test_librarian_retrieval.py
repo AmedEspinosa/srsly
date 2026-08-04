@@ -90,10 +90,16 @@ async def test_context_injection_records_pages_on_the_session(
         db.add(session)
         await db.flush()
 
-        context = await retrieval.build_session_context(db, settings, project, session)
+        context, status = await retrieval.build_session_context(
+            db, settings, project, session
+        )
 
         # FR-35 — the super summary is in the context.
         assert "Demo super summary" in context
+        # The status the UI reports agrees with what was actually built.
+        assert status.has_context
+        assert status.super_summary_found
+        assert status.pages == [CONCEPT_PATH]
         # FR-36 — so is the selected page.
         assert "Org-scoped roles" in context
         # FR-37 — and the set is recorded on the session.
@@ -119,7 +125,14 @@ async def test_context_is_empty_when_the_wiki_is_not_initialized(
         db.add(session)
         await db.flush()
 
-        assert await retrieval.build_session_context(db, settings, project, session) == ""
+        context, status = await retrieval.build_session_context(
+            db, settings, project, session
+        )
+        assert context == ""
+        # Empty, but not silent — the reason is reportable to the UI.
+        assert not status.initialized
+        assert not status.has_context
+        assert status.hint and "llm-wiki" in status.hint
 
 
 def test_context_block_is_marked_as_authoritative_background() -> None:

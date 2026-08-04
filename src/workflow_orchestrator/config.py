@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     WORKFLOW_RUN_COST_CEILING_USD: float = 5.00
     WORKFLOW_RUN_POLL_SECONDS: int = 5  # FR-34 requires <= 10
 
+    # --- Post-merge as-built record -------------------------------------------
+    # The as-built document's home is the wiki. Mirroring it onto the merged PR
+    # is a convenience, and it publishes to GitHub, so it stays opt-in.
+    WORKFLOW_POST_AS_BUILT_COMMENT: bool = False
+
     # --- Sandbox --------------------------------------------------------------
     DOCKER_IMAGE_AGENT: str | None = None
     # When Docker is unavailable the supervisor falls back to detached host

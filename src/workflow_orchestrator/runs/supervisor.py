@@ -31,6 +31,7 @@ from ..config import Settings
 from ..db import session_scope
 from ..harness import get_adapter
 from ..harness.base import HarnessOperation, RunEvent
+from ..harness.lines import LineBuffer
 from ..logging import get_logger
 from ..models import Harness, Phase, Run, RunStatus, Session, utcnow
 from .base import LaunchSpec, RunHandle, RunnerBackend, RunState
@@ -193,7 +194,9 @@ class RunSupervisor:
     ) -> None:
         backend = active.backend or self.backend_for_handle(active.handle)
         offset = 0
-        pending = b""
+        # Shared with the foreground streaming path so line reassembly — and its
+        # oversize guard — has one implementation and one set of tests.
+        buffer = LineBuffer()
         poll_interval = self._settings.WORKFLOW_RUN_POLL_SECONDS  # FR-34, <= 10s
         last_poll = 0.0
         final_status = RunStatus.COMPLETED
@@ -211,12 +214,8 @@ class RunSupervisor:
                             handle_file.seek(offset)
                             chunk = handle_file.read(size - offset)
                             offset = size
-                        pending += chunk
-                        *complete, pending = pending.split(b"\n")
-                        for raw in complete:
-                            event = adapter.parse_line(  # type: ignore[attr-defined]
-                                raw.decode("utf-8", errors="replace")
-                            )
+                        for line in buffer.feed(chunk):
+                            event = adapter.parse_line(line)  # type: ignore[attr-defined]
                             if event is None:
                                 continue
                             active.events.append(event)
