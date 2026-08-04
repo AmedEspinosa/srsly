@@ -117,9 +117,8 @@ The SRS states what was *proposed*. Ingesting only that leaves the wiki
 recording intentions as facts — a session that drops a requirement leaves no
 trace, and the next one is told the feature exists.
 
-So after a pull request merges, the write-back runs the **reviewing** harness
-once more (FR-23's reasoning: the harness that wrote the code is the wrong one
-to certify it) to produce `.workflow/as-built.md`: every `FR-N`/`NFR-N`/`AC-N`
+So after a pull request merges, the write-back runs the configured **reviewing**
+harness once more to produce `.workflow/as-built.md`: every `FR-N`/`NFR-N`/`AC-N`
 marked `implemented`, `deviated`, `dropped` or `unverified`, each with the
 `file:line` where it lives. That document is ingested *after* `srs.md`, framed
 so the Librarian knows it supersedes the specification where the two disagree.
@@ -150,7 +149,7 @@ uv run pytest -m acceptance  # SRS §7 criteria only
 |---|---|---|
 | AC-1 session persistence across restart | `test_acceptance_persistence.py` (real uvicorn + `SIGKILL`) | automated |
 | AC-2 phase blocked without approval | `test_api_approvals.py` | automated |
-| AC-3 cross-harness enforcement | `test_api_projects_sessions.py` (+ DB `CHECK`) | automated |
+| AC-3 independent harness selection | `test_api_projects_sessions.py` (+ migration checks) | automated |
 | AC-4 run reattach after restart | `test_run_supervisor.py` | automated (host runner) |
 | AC-5 cost ceiling termination | `test_run_supervisor.py` | automated (host runner) |
 | AC-6 wiki write serialisation | `test_acceptance_wiki.py` | automated |

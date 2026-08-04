@@ -52,7 +52,6 @@
         </select>
       </label>
     </div>
-    <p class="meta">Review always runs on the opposite harness (FR-9).</p>
     <div class="actions">
       <button class="primary" type="submit">Start session</button>
     </div>
@@ -63,17 +62,6 @@
 {% block scripts %}
 <script>
 const form = document.getElementById("new-session");
-const implementSelect = form.querySelector('[name="harness_implement"]');
-const reviewSelect = form.querySelector('[name="harness_review"]');
-
-// Keep the two selects opposed client-side so FR-9 is a guard rail, not a
-// surprise 422 after the user has typed a prompt.
-implementSelect.addEventListener("change", () => {
-  reviewSelect.value = implementSelect.value === "claude_code" ? "codex" : "claude_code";
-});
-reviewSelect.addEventListener("change", () => {
-  implementSelect.value = reviewSelect.value === "claude_code" ? "codex" : "claude_code";
-});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

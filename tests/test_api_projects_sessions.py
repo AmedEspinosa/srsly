@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from httpx import AsyncClient
+from sqlalchemy import select
+
+from workflow_orchestrator.db import get_sessionmaker
+from workflow_orchestrator.models import Session
 
 from .conftest import worktree_for
 
@@ -65,8 +69,9 @@ async def test_session_creates_a_worktree(
     assert not (repo / ".gitignore").exists(), "the user's repo must not be edited"
 
 
-async def test_same_harness_rejected(client: AsyncClient, project: dict) -> None:
-    """AC-3 — 422 {"error": "same_harness_not_allowed"}."""
+async def test_same_harness_claude_code_is_allowed(
+    client: AsyncClient, project: dict
+) -> None:
     response = await client.post(
         f"/projects/{project['id']}/sessions",
         json={
@@ -75,11 +80,12 @@ async def test_same_harness_rejected(client: AsyncClient, project: dict) -> None
             "harness_review": "claude_code",
         },
     )
-    assert response.status_code == 422
-    assert response.json() == {"error": "same_harness_not_allowed"}
+    assert response.status_code == 201
+    assert response.json()["harness_implement"] == "claude_code"
+    assert response.json()["harness_review"] == "claude_code"
 
 
-async def test_same_harness_rejected_for_codex_too(
+async def test_same_harness_codex_is_allowed(
     client: AsyncClient, project: dict
 ) -> None:
     response = await client.post(
@@ -90,8 +96,30 @@ async def test_same_harness_rejected_for_codex_too(
             "harness_review": "codex",
         },
     )
-    assert response.status_code == 422
-    assert response.json() == {"error": "same_harness_not_allowed"}
+    assert response.status_code == 201
+    assert response.json()["harness_implement"] == "codex"
+    assert response.json()["harness_review"] == "codex"
+
+
+async def test_same_harness_values_are_persisted(
+    client: AsyncClient, project: dict
+) -> None:
+    response = await client.post(
+        f"/projects/{project['id']}/sessions",
+        json={
+            "feature_prompt": "anything",
+            "harness_implement": "claude_code",
+            "harness_review": "claude_code",
+        },
+    )
+    assert response.status_code == 201
+
+    async with get_sessionmaker()() as db:
+        stored = await db.scalar(select(Session).where(Session.id == response.json()["id"]))
+
+    assert stored is not None
+    assert stored.harness_implement == "claude_code"
+    assert stored.harness_review == "claude_code"
 
 
 async def test_reversed_pairing_is_allowed(client: AsyncClient, project: dict) -> None:
@@ -105,6 +133,42 @@ async def test_reversed_pairing_is_allowed(client: AsyncClient, project: dict) -
     )
     assert response.status_code == 201
     assert response.json()["harness_implement"] == "codex"
+
+
+async def test_invalid_implement_harness_returns_422(
+    client: AsyncClient, project: dict
+) -> None:
+    response = await client.post(
+        f"/projects/{project['id']}/sessions",
+        json={
+            "feature_prompt": "anything",
+            "harness_implement": "gpt-4o",
+            "harness_review": "codex",
+        },
+    )
+    assert response.status_code == 422
+    assert any(
+        "harness_implement" in str(error["loc"])
+        for error in response.json()["detail"]
+    )
+
+
+async def test_invalid_review_harness_returns_422(
+    client: AsyncClient, project: dict
+) -> None:
+    response = await client.post(
+        f"/projects/{project['id']}/sessions",
+        json={
+            "feature_prompt": "anything",
+            "harness_implement": "codex",
+            "harness_review": "gpt-4o",
+        },
+    )
+    assert response.status_code == 422
+    assert any(
+        "harness_review" in str(error["loc"])
+        for error in response.json()["detail"]
+    )
 
 
 async def test_session_detail_includes_worktree_and_phases(
