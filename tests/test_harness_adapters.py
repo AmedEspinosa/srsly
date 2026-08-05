@@ -289,6 +289,6 @@ def test_registry_returns_the_right_adapter(settings: Settings) -> None:
 
 
 def test_opposite_harness_pairs_correctly() -> None:
-    """FR-23 — review runs on the harness not used for implementation."""
+    """The enum helper returns the alternate harness member."""
     assert Harness.CLAUDE_CODE.other() is Harness.CODEX
     assert Harness.CODEX.other() is Harness.CLAUDE_CODE

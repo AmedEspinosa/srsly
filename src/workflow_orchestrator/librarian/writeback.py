@@ -402,8 +402,8 @@ async def generate_as_built(settings: Settings, session: Session, worktree: Path
     branch entirely; a record written when the PR opened would describe a state
     that no longer exists.
 
-    The *reviewing* harness runs it, for FR-23's reason: the harness that wrote
-    the code is the wrong one to certify what the code does.
+    The configured *reviewing* harness runs it after the merge, using the same
+    session selection as the review phase.
 
     Every failure path returns None and logs. The write-back must still ingest
     the specification if this cannot run — a wiki with the SRS alone is what we

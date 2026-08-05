@@ -30,12 +30,10 @@ async def _project_or_404(db: DbSession, session: CurrentSession):
 
 
 def _reviewing_harness(session: CurrentSession) -> Harness:
-    """FR-23 — the harness *not* used for implementation.
+    """Return the harness configured for the review phase.
 
-    ``harness_review`` is already constrained to differ from
-    ``harness_implement`` by the DB CHECK and the API layer, so this is a read
-    rather than a computation; deriving it from ``other()`` as well would let the
-    two disagree silently.
+    This is intentionally a direct read rather than a derivation from the
+    implementation harness: both selections are independent session settings.
     """
     return Harness(session.harness_review)
 
@@ -44,7 +42,7 @@ def _reviewing_harness(session: CurrentSession) -> Harness:
 async def run_review(
     db: DbSession, settings: AppSettings, session: CurrentSession
 ) -> dict[str, object]:
-    """FR-23/FR-24 — cross-harness review producing ``.workflow/review.md``."""
+    """FR-23/FR-24 — review with the configured harness."""
     project = await _project_or_404(db, session)
 
     try:
