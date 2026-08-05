@@ -126,6 +126,12 @@ class Session(Base):
     )
     created_at: Mapped[str] = mapped_column(String, nullable=False, default=utcnow)
     completed_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    # When the Librarian ingested this session (FR-29). Deliberately separate
+    # from ``completed_at``: "the session is finished" and "the wiki has this"
+    # are different facts, and conflating them meant a session completed by hand
+    # locked itself out of the write-back permanently — the merge poller skipped
+    # it for being complete, and ``_on_merged`` skipped it for the same reason.
+    wiki_writeback_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Not in §5.1's DDL, but the merge phase needs somewhere to remember the PR
     # it opened so polling survives a restart (FR-29, NFR-4).

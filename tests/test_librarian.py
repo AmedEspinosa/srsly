@@ -140,6 +140,42 @@ def test_has_needs_review_is_false_without_frontmatter() -> None:
     assert has_needs_review("# Page\n") is False
 
 
+# The invariant whose absence let the two halves drift: clearing used to live in
+# the API layer and only rewrote an *existing* key, so a page whose frontmatter
+# lacked it was silently left flagged while the queue recorded it as reviewed.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# Page\n\nBody.\n",
+        "---\ntitle: x\n---\n\nBody.\n",
+        "---\nneeds_review: true\n---\n\nBody.\n",
+        "---\nneeds_review: false\n---\n\nBody.\n",
+        "---\nneeds_review :  true\n---\n\nBody.\n",
+    ],
+)
+def test_set_needs_review_round_trips(text: str) -> None:
+    from workflow_orchestrator.librarian.writeback import (
+        clear_needs_review,
+        set_needs_review,
+    )
+
+    flagged = set_needs_review(text, True)
+    assert flagged is not None
+    assert has_needs_review(flagged)
+
+    # Clearing always reaches "not flagged", whether it rewrites the key, adds
+    # it, or declines to manufacture frontmatter that was never there.
+    assert has_needs_review(clear_needs_review(text) or text) is False
+    assert has_needs_review(clear_needs_review(flagged) or "") is False
+
+
+def test_clear_needs_review_declines_to_invent_frontmatter() -> None:
+    """A page with no frontmatter was never flagged; leave it alone."""
+    from workflow_orchestrator.librarian.writeback import clear_needs_review
+
+    assert clear_needs_review("# Just a page\n") is None
+
+
 # --- FR-42 / AC-6: write serialisation -----------------------------------------
 
 

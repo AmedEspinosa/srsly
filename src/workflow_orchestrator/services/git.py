@@ -273,12 +273,26 @@ class GitService:
     async def view_pull_request(
         self, worktree: Path | str, *, ref: str | None = None
     ) -> PullRequest | None:
-        """FR-29 — ``gh pr view --json state``."""
+        """FR-29 — ``gh pr view --json state``.
+
+        Never raises. ``gh`` may be absent, the worktree may have been removed
+        out from under us, and the call may time out — and every caller here is
+        a poll or a status check where "I could not find out" is a legitimate
+        answer. Letting those escape turned a missing ``gh`` into a 500 on the
+        merge-status endpoint and aborted an entire poll pass on one bad
+        session.
+        """
         argv = [self._gh, "pr", "view"]
         if ref:
             argv.append(ref)
         argv += ["--json", "number,url,state"]
-        result = await run_command(argv, cwd=worktree, timeout=60.0)
+        try:
+            result = await run_command(argv, cwd=worktree, timeout=60.0)
+        except (FileNotFoundError, TimeoutError, OSError) as exc:
+            log.warning(
+                "gh.pr_view_unavailable", worktree=str(worktree), error=str(exc)
+            )
+            return None
         if not result.ok:
             return None
         try:

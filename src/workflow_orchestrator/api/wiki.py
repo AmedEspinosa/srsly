@@ -8,11 +8,11 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
-from ..librarian.layout import layout_for
+from ..librarian.layout import WikiLayout, layout_for
 from ..librarian.lint import run_lint
 from ..librarian.queue import get_queue
 from ..librarian.writeback import (
-    FRONTMATTER,
+    clear_needs_review,
     has_needs_review,
     log_index_metrics,
 )
@@ -25,26 +25,101 @@ log = get_logger(__name__)
 router = APIRouter(tags=["wiki"])
 
 
-def _clear_needs_review(text: str) -> str:
-    import re
+async def _candidate_layouts(db: DbSession) -> list[WikiLayout]:
+    """Every distinct wiki repo any project is configured against.
 
-    match = FRONTMATTER.match(text)
-    if not match:
-        return text
-    block = re.sub(
-        r"^needs_review\s*:.*$", "needs_review: false", match.group(1), flags=re.MULTILINE
-    )
-    return f"---\n{block}\n---\n" + text[match.end() :]
-
-
-async def _project_for_page(db: DbSession, page_path: str) -> Project | None:
-    """Find the project whose wiki repo contains ``page_path``."""
+    Deduped by ``repo_root``, not by project: two projects can share one vault
+    (and in practice do), and ``discover_repo_root`` normalises ``…/llm-wiki``
+    and ``…/llm-wiki/wiki`` to the same root. "Which project owns this page" was
+    never the question — which repo holds it is.
+    """
     projects = (await db.execute(select(Project))).scalars().all()
+    seen: set[str] = set()
+    layouts: list[WikiLayout] = []
     for project in projects:
-        candidate = Path(project.wiki_repo_path) / page_path
-        if candidate.exists():
-            return project
-    return projects[0] if projects else None
+        layout = layout_for(project.wiki_repo_path)
+        key = str(layout.repo_root)
+        if key not in seen:
+            seen.add(key)
+            layouts.append(layout)
+    return layouts
+
+
+async def _locate_page(db: DbSession, page_path: str) -> tuple[WikiLayout, Path]:
+    """The layout and on-disk path for a queued page.
+
+    Resolution goes through ``layout.resolve``, which knows both vault shapes —
+    the previous lookup joined the *configured* path with a path stored relative
+    to the discovered repo root, so it never matched and always fell through to
+    the first project. There is no such fallback now: acting on the wrong repo
+    is worse than refusing, because rejecting a page deletes files.
+    """
+    layouts = await _candidate_layouts(db)
+    if not layouts:
+        raise HTTPException(status_code=404, detail="no project configured")
+
+    escaped = 0
+    for layout in layouts:
+        try:
+            path = layout.resolve(page_path)
+        except ValueError:
+            escaped += 1
+            continue
+        if path.exists():
+            return layout, path
+
+    if escaped == len(layouts):
+        raise HTTPException(status_code=400, detail="path escapes the wiki repo")
+    raise HTTPException(status_code=404, detail="page not found")
+
+
+async def _locate_for_reject(db: DbSession, page_path: str) -> tuple[WikiLayout, Path]:
+    """Like :func:`_locate_page`, but tolerates a page that is already gone.
+
+    Rejecting a page that no longer exists on disk is legitimate — it may have
+    been deleted by hand, or by an earlier reject — and must still clear the
+    queue entry. The path is still validated against every candidate repo; what
+    is relaxed is only the existence check.
+    """
+    try:
+        return await _locate_page(db, page_path)
+    except HTTPException as exc:
+        if exc.status_code != 404 or exc.detail != "page not found":
+            raise
+
+    layouts = await _candidate_layouts(db)
+    resolvable = []
+    for layout in layouts:
+        try:
+            resolvable.append((layout, layout.resolve(page_path)))
+        except ValueError:  # pragma: no cover - _locate_page ruled this out
+            continue
+    if len(resolvable) == 1:
+        return resolvable[0]
+
+    # Several vaults could hold this path and none does. Let git decide: the
+    # first repo that can restore the file is the one that owned it.
+    from ..services.process import run_command
+
+    for layout, path in resolvable:
+        probe = await run_command(
+            ["git", "cat-file", "-e", f"HEAD:{_git_path(layout, path)}"],
+            cwd=layout.repo_root,
+            timeout=30,
+        )
+        if probe.ok:
+            return layout, path
+    raise HTTPException(status_code=404, detail="page not found")
+
+
+def _git_path(layout: WikiLayout, path: Path) -> str:
+    """Repo-relative POSIX path, after ``resolve`` may have redirected it.
+
+    Git must be handed the path the file actually has. Passing the stored string
+    straight through makes ``git show HEAD:…`` miss whenever the vault nests its
+    page directories, which reports every such page as newly created.
+    """
+    return path.relative_to(layout.repo_root.resolve()).as_posix()
 
 
 @router.get("/wiki/review-queue")
@@ -103,17 +178,8 @@ async def review_queue(db: DbSession) -> dict[str, object]:
 @router.get("/wiki/review-queue/{page_path:path}/diff")
 async def page_diff(db: DbSession, page_path: str) -> dict[str, object]:
     """FR-40 — inline diff of an automated write against its committed version."""
-    project = await _project_for_page(db, page_path)
-    if project is None:
-        raise HTTPException(status_code=404, detail="no project configured")
-
-    layout = layout_for(project.wiki_repo_path)
-    try:
-        path = layout.resolve(page_path)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="path escapes the wiki repo")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="page not found")
+    layout, path = await _locate_page(db, page_path)
+    git_path = _git_path(layout, path)
 
     current = path.read_text(encoding="utf-8", errors="replace")
 
@@ -123,7 +189,7 @@ async def page_diff(db: DbSession, page_path: str) -> dict[str, object]:
 
     previous = ""
     result = await run_command(
-        ["git", "show", f"HEAD:{page_path}"], cwd=layout.repo_root, timeout=30
+        ["git", "show", f"HEAD:{git_path}"], cwd=layout.repo_root, timeout=30
     )
     if result.ok:
         previous = result.stdout
@@ -132,8 +198,8 @@ async def page_diff(db: DbSession, page_path: str) -> dict[str, object]:
         difflib.unified_diff(
             previous.splitlines(keepends=True),
             current.splitlines(keepends=True),
-            fromfile=f"a/{page_path}",
-            tofile=f"b/{page_path}",
+            fromfile=f"a/{git_path}",
+            tofile=f"b/{git_path}",
         )
     )
     return {
@@ -148,22 +214,18 @@ async def page_diff(db: DbSession, page_path: str) -> dict[str, object]:
 @router.post("/wiki/review-queue/{page_path:path}/approve")
 async def approve_page(db: DbSession, page_path: str) -> dict[str, object]:
     """FR-40 — clear the ``needs_review`` flag."""
-    project = await _project_for_page(db, page_path)
-    if project is None:
-        raise HTTPException(status_code=404, detail="no project configured")
+    _layout, path = await _locate_page(db, page_path)
 
-    layout = layout_for(project.wiki_repo_path)
-    try:
-        path = layout.resolve(page_path)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="path escapes the wiki repo")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="page not found")
-
-    path.write_text(
-        _clear_needs_review(path.read_text(encoding="utf-8", errors="replace")),
-        encoding="utf-8",
-    )
+    # A page with no frontmatter cannot carry the flag, so there is nothing to
+    # clear. Report that rather than writing a frontmatter block onto a page
+    # nobody flagged — and say so in the response, so the UI cannot present a
+    # no-op as a successful edit.
+    text = path.read_text(encoding="utf-8", errors="replace")
+    cleared = clear_needs_review(text)
+    if cleared is None:
+        log.info("wiki.needs_review_absent", page_path=page_path)
+    elif cleared != text:
+        path.write_text(cleared, encoding="utf-8")
 
     rows = (
         await db.execute(select(WikiWrite).where(WikiWrite.page_path == page_path))
@@ -172,29 +234,46 @@ async def approve_page(db: DbSession, page_path: str) -> dict[str, object]:
         row.needs_review = 0
 
     log.info("wiki.page_approved", page_path=page_path)
-    return {"page_path": page_path, "needs_review": False}
+    return {
+        "page_path": page_path,
+        "needs_review": False,
+        "frontmatter_cleared": cleared is not None,
+    }
 
 
 @router.post("/wiki/review-queue/{page_path:path}/reject")
 async def reject_page(db: DbSession, page_path: str) -> dict[str, object]:
-    """Revert an automated write to its committed state."""
-    project = await _project_for_page(db, page_path)
-    if project is None:
-        raise HTTPException(status_code=404, detail="no project configured")
+    """Revert an automated write to its committed state.
 
-    layout = layout_for(project.wiki_repo_path)
+    Note this does *not* leave the wiki repo clean. Pages are committed carrying
+    ``needs_review: true``, so reverting restores that flag — which is how the
+    vault ended up full of pages the file called unreviewed and the database
+    called dispositioned. Rejecting is a review, so the flag is cleared
+    afterwards, at the cost of a one-line working-tree diff.
+    """
     from ..services.process import run_command
 
+    # Validate before acting. The destructive branch below is an unlink, and it
+    # used to run on a path that had never been checked against the repo root.
+    layout, path = await _locate_for_reject(db, page_path)
+
     result = await run_command(
-        ["git", "checkout", "--", page_path], cwd=layout.repo_root, timeout=30
+        ["git", "checkout", "--", _git_path(layout, path)],
+        cwd=layout.repo_root,
+        timeout=30,
     )
     reverted = result.ok
-    if not reverted:
+    frontmatter_cleared = False
+    if reverted:
+        if path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            cleared = clear_needs_review(text)
+            if cleared is not None and cleared != text:
+                path.write_text(cleared, encoding="utf-8")
+                frontmatter_cleared = True
+    else:
         # The page was newly created, so there is nothing to revert to.
-        try:
-            layout.resolve(page_path).unlink(missing_ok=True)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="path escapes the wiki repo")
+        path.unlink(missing_ok=True)
 
     rows = (
         await db.execute(select(WikiWrite).where(WikiWrite.page_path == page_path))
@@ -202,8 +281,18 @@ async def reject_page(db: DbSession, page_path: str) -> dict[str, object]:
     for row in rows:
         row.needs_review = 0
 
-    log.info("wiki.page_rejected", page_path=page_path, reverted=reverted)
-    return {"page_path": page_path, "reverted": reverted, "deleted": not reverted}
+    log.info(
+        "wiki.page_rejected",
+        page_path=page_path,
+        reverted=reverted,
+        frontmatter_cleared=frontmatter_cleared,
+    )
+    return {
+        "page_path": page_path,
+        "reverted": reverted,
+        "deleted": not reverted,
+        "frontmatter_cleared": frontmatter_cleared,
+    }
 
 
 @router.post("/wiki/lint")

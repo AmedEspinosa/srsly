@@ -126,14 +126,112 @@ async def test_ac6_concurrent_writebacks_do_not_interleave(
 async def test_writeback_skips_an_uninitialized_wiki(
     settings: Settings, client, project: dict, repo: Path
 ) -> None:
-    """A project whose wiki repo was never scaffolded must not crash the merge."""
+    """A project whose wiki repo was never scaffolded must not crash the merge.
+
+    ``run_post_merge`` raises so the queued task can release its claim — an
+    unscaffolded wiki is a fixable configuration problem, and the session must
+    still be ingested once ``wiki init`` has been run. The property the merge
+    path depends on is that *enqueueing* stays quiet, which is asserted here.
+    """
     response = await client.post(
         f"/projects/{project['id']}/sessions", json={"feature_prompt": "x"}
     )
     session_id = response.json()["id"]
 
-    written = await writeback.run_post_merge(settings, project["id"], session_id)
-    assert written == []
+    with pytest.raises(writeback.WikiNotInitialized):
+        await writeback.run_post_merge(settings, project["id"], session_id)
+
+    await writeback.enqueue_post_merge(settings, project["id"], session_id)
+    await get_queue().drain()
+
+    async with session_scope() as db:
+        session = await db.get(Session, session_id)
+        assert session is not None
+        assert session.wiki_writeback_at is None  # claim released, not stuck
+
+
+def _stub_wiki_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Silence everything in a write-back that would shell out."""
+    monkeypatch.setattr(
+        "workflow_orchestrator.librarian.lint.run_lint",
+        lambda *a, **k: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        writeback, "generate_as_built", lambda *a, **k: asyncio.sleep(0, result=None)
+    )
+
+
+async def _writeback_stamp(session_id: str) -> str | None:
+    async with session_scope() as db:
+        row = await db.get(Session, session_id)
+        assert row is not None
+        return row.wiki_writeback_at
+
+
+async def test_writeback_claim_is_set_on_success(
+    settings: Settings, two_sessions, wiki_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_id, session_ids = two_sessions
+    _stub_wiki_agents(monkeypatch)
+
+    async def fake_ingest(settings_, project_, source: Path, policy_) -> list[str]:
+        return []
+
+    monkeypatch.setattr(writeback, "_ingest_one", fake_ingest)
+
+    await writeback.enqueue_post_merge(settings, project_id, session_ids[0])
+    await get_queue().drain()
+
+    assert await _writeback_stamp(session_ids[0]) is not None
+
+
+async def test_writeback_claim_is_released_when_the_task_fails(
+    settings: Settings, two_sessions, wiki_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write-back must be retryable.
+
+    Claiming and never releasing would rebuild the bug this whole change exists
+    to fix — a guard that silently makes ingestion unreachable forever — just in
+    a different column.
+    """
+    project_id, session_ids = two_sessions
+    _stub_wiki_agents(monkeypatch)
+
+    async def exploding_ingest(settings_, project_, source: Path, policy_) -> list[str]:
+        raise RuntimeError("codex is not installed")
+
+    monkeypatch.setattr(writeback, "_ingest_one", exploding_ingest)
+
+    await writeback.enqueue_post_merge(settings, project_id, session_ids[0])
+    await get_queue().drain()
+
+    assert await _writeback_stamp(session_ids[0]) is None
+    assert session_ids[0] not in writeback._IN_FLIGHT
+
+
+async def test_concurrent_enqueues_of_one_session_run_once(
+    settings: Settings, two_sessions, wiki_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The poller ticks every 60s; a write-back takes minutes."""
+    project_id, session_ids = two_sessions
+    _stub_wiki_agents(monkeypatch)
+
+    runs: list[str] = []
+
+    async def counting_ingest(settings_, project_, source: Path, policy_) -> list[str]:
+        runs.append(source.name)
+        return []
+
+    monkeypatch.setattr(writeback, "_ingest_one", counting_ingest)
+
+    await asyncio.gather(
+        writeback.enqueue_post_merge(settings, project_id, session_ids[0]),
+        writeback.enqueue_post_merge(settings, project_id, session_ids[0]),
+    )
+    await get_queue().drain()
+
+    assert get_queue().completed == [f"post-merge:{session_ids[0]}"]
+    assert runs == ["srs.md"]
 
 
 async def test_only_the_srs_is_ingested(
