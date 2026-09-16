@@ -6,7 +6,13 @@ planning, editing and review are delegated to existing agent harnesses (Claude
 Code, Codex), while this app owns the state machine, process supervision, Git
 integration and wiki automation that otherwise require manual coordination.
 
-Implements the SRS at `notes/personal/scratchpad/tech-stuff/ai_driven_workflow_srs.md`.
+> **Status:** personal project, pre-1.0. The host runner and the full phase
+> pipeline are exercised end to end; the Docker sandbox and PR creation against
+> a real remote are documented below as unverified.
+
+The design follows a Software Requirements Specification (SRS) that is not
+part of this repository; the `FR-N`, `NFR-N`, `AC-N` and `§` references
+throughout the code and this README point at its sections.
 
 ## Phases
 

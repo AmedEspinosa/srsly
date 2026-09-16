@@ -24,6 +24,7 @@ from ..schemas import (
 )
 from ..services import workflow
 from .deps import (
+    AppSettings,
     CurrentSession,
     DbSession,
     phase_error_response,
@@ -56,7 +57,10 @@ async def get_session(db: DbSession, session: CurrentSession) -> SessionDetail:
 
 @router.post("/sessions/{session_id}/approve", response_model=ApprovalOut)
 async def approve(
-    db: DbSession, session: CurrentSession, payload: ApprovalCreate
+    db: DbSession,
+    settings: AppSettings,
+    session: CurrentSession,
+    payload: ApprovalCreate,
 ) -> ApprovalOut | Response:
     project = await workflow.get_project(db, session.project_id)
     if project is None:  # pragma: no cover - FK guarantees this
@@ -70,6 +74,16 @@ async def approve(
         return phase_error_response(exc)
     except workflow.WorkflowError as exc:
         return workflow_error_response(exc)
+
+    # FR-29 — approving the merge phase completes the session, but only a merged
+    # pull request should trigger the Librarian. Checked here rather than in
+    # record_approval, which is a pure-DB function with no Settings and is
+    # shared by the JSON API and the HTML UI.
+    if payload.phase is Phase.MERGE:
+        from .merge import reconcile_after_manual_approval
+
+        await reconcile_after_manual_approval(db, settings, session)
+
     return ApprovalOut.model_validate(approval)
 
 

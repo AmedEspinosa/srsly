@@ -8,3 +8,11 @@ dist/
 build/
 .DS_Store
 .env
+
+# local state
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.claude/
+.workflow/
+worktrees/

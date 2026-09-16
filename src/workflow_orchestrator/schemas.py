@@ -58,6 +58,7 @@ class SessionOut(BaseModel):
     wiki_pages_injected: list[str] = Field(default_factory=list)
     created_at: str
     completed_at: str | None = None
+    wiki_writeback_at: str | None = None
     branch_name: str | None = None
     pr_url: str | None = None
     pr_number: int | None = None

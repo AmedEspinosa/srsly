@@ -86,7 +86,7 @@ def test_migrate_is_idempotent_and_records_its_version(tmp_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         versions = conn.execute("SELECT version_num FROM alembic_version").fetchall()
     assert len(versions) == 1, "alembic_version must be committed, not rolled back"
-    assert versions[0][0] == "0003"
+    assert versions[0][0] == "0004"
 
     second = _migrate(db_path)
     assert second.returncode == 0, second.stderr
@@ -154,6 +154,9 @@ def test_downgrade_fails_safely_for_same_harness_rows(tmp_path: Path) -> None:
     with pytest.raises(Exception, match="ck_sessions_cross_harness"):
         _alembic(db_path, "downgrade", "0002")
 
+    # Alembic applies each step in order: 0004 -> 0003 succeeds and is stamped,
+    # then 0003 -> 0002 raises. The database is left at the last step that
+    # completed, with the session row intact.
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0003"
         assert conn.execute("SELECT id FROM sessions").fetchall() == [("session",)]

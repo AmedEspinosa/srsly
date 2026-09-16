@@ -14,7 +14,10 @@ from ..models import Project, Session
 from ..phases import PhaseError
 from ..services import workflow
 
-DbSession = Annotated[AsyncSession, Depends(get_db)]
+# scope="function": commit before the response is sent. FastAPI >= 0.118 runs
+# the exit code of a yield dependency *after* the response by default, which
+# would let a client see 200 for a write that is not yet durable (AC-1).
+DbSession = Annotated[AsyncSession, Depends(get_db, scope="function")]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 
 

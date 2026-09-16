@@ -40,6 +40,29 @@
 </div>
 {% endif %}
 
+{% if session.completed_at %}
+<h2>Wiki write-back</h2>
+<div class="card">
+  <p class="meta">
+    The Librarian produces the as-built record and ingests this session into the
+    wiki once its pull request has merged. A session completed by hand before the
+    merge stays under observation — merge state is polled every
+    {{ merge_poll_seconds }}s — so this normally needs no intervention.
+  </p>
+  {% if session.wiki_writeback_at %}
+  <p>
+    ingested <span class="mono">{{ session.wiki_writeback_at }}</span>
+  </p>
+  {% else %}
+  <p class="meta">not yet ingested</p>
+  {% endif %}
+  <div class="actions">
+    <button id="writeback-run">Run write-back now</button>
+    <span class="meta" id="writeback-status"></span>
+  </div>
+</div>
+{% endif %}
+
 {% if session.current_phase == "completed" %}
 <h2>As-built</h2>
 <div class="card">
@@ -374,6 +397,31 @@ if (mergeButton) {
       wo.toast(err.message, true);
     } finally {
       event.target.disabled = false;
+    }
+  });
+}
+
+// ── Wiki write-back: recovery when gh never reported the merge ──────────────
+const writebackButton = document.getElementById("writeback-run");
+if (writebackButton) {
+  const writebackStatus = document.getElementById("writeback-status");
+  writebackButton.addEventListener("click", async () => {
+    writebackButton.disabled = true;
+    writebackStatus.textContent = "queueing…";
+    try {
+      const result = await wo.api(
+        `/sessions/${SESSION_ID}/wiki-writeback`, { method: "POST" });
+      if (result.enqueued) {
+        writebackStatus.textContent =
+          "queued — the as-built run takes a few minutes; reload to see the result.";
+      } else {
+        writebackStatus.textContent = result.reason;
+      }
+    } catch (err) {
+      wo.toast(err.message, true);
+      writebackStatus.textContent = "";
+    } finally {
+      writebackButton.disabled = false;
     }
   });
 }

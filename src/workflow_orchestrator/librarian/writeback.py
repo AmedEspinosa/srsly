@@ -27,6 +27,7 @@ regeneration is only ever *proposed* (FR-41).
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,10 @@ from .queue import get_queue
 log = get_logger(__name__)
 
 INGEST_TIMEOUT_SECONDS = 900.0
+
+
+class WikiNotInitialized(RuntimeError):
+    """The project points at a path with no scaffolded wiki."""
 
 
 SPEC_FRAMING = """\
@@ -129,22 +134,49 @@ def ingestible_artifacts(worktree: Path) -> list[tuple[Path, ArtifactPolicy]]:
 # --- frontmatter ---------------------------------------------------------------
 
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+NEEDS_REVIEW_LINE = re.compile(r"^needs_review\s*:.*$", re.MULTILINE)
+
+
+def set_needs_review(text: str, value: bool) -> str | None:
+    """Write ``needs_review: <value>`` into a page's frontmatter.
+
+    Returns the new text, or ``None`` when there is nothing to do.
+
+    Both directions live here on purpose. The clearing half used to be a private
+    helper in the API layer, so nothing forced the two to agree — and they
+    didn't: it only rewrote an *existing* ``needs_review:`` line, silently
+    no-opping on a page whose frontmatter lacked the key while the endpoint
+    still marked the page reviewed in the database.
+
+    Deliberately not perfectly symmetric, for one case. Setting ``True`` creates
+    frontmatter when absent, because FR-39 requires the flag to be present and
+    true and a page carrying none is unflagged. Setting ``False`` does not,
+    because absence already means "not flagged" — manufacturing a frontmatter
+    block on a human-authored page would be a write nobody asked for.
+    """
+    flag = "true" if value else "false"
+    match = FRONTMATTER.match(text)
+    if not match:
+        return f"---\nneeds_review: {flag}\n---\n\n{text.lstrip()}" if value else None
+
+    block = match.group(1)
+    if NEEDS_REVIEW_LINE.search(block):
+        block = NEEDS_REVIEW_LINE.sub(f"needs_review: {flag}", block)
+    else:
+        block = block.rstrip() + f"\nneeds_review: {flag}"
+    return f"---\n{block}\n---\n" + text[match.end() :]
 
 
 def ensure_needs_review(text: str) -> str:
     """FR-39 — force ``needs_review: true`` into a page's frontmatter."""
-    match = FRONTMATTER.match(text)
-    if not match:
-        return f"---\nneeds_review: true\n---\n\n{text.lstrip()}"
+    result = set_needs_review(text, True)
+    assert result is not None  # value=True always produces a document
+    return result
 
-    block = match.group(1)
-    if re.search(r"^needs_review\s*:", block, re.MULTILINE):
-        block = re.sub(
-            r"^needs_review\s*:.*$", "needs_review: true", block, flags=re.MULTILINE
-        )
-    else:
-        block = block.rstrip() + "\nneeds_review: true"
-    return f"---\n{block}\n---\n" + text[match.end() :]
+
+def clear_needs_review(text: str) -> str | None:
+    """Inverse of :func:`ensure_needs_review`; ``None`` if there is no frontmatter."""
+    return set_needs_review(text, False)
 
 
 def has_needs_review(text: str) -> bool:
@@ -447,12 +479,13 @@ async def run_post_merge(settings: Settings, project_id: str, session_id: str) -
 
     layout = layout_for(project.wiki_repo_path)
     if not layout.is_initialized():
-        log.warning(
-            "wiki.not_initialized_skipping_writeback",
-            project_id=project_id,
-            hint="run: workflow-orchestrator wiki init <path>",
+        # Raise rather than return empty: this is a fixable configuration
+        # problem, and the caller releases the write-back claim on failure so
+        # the session is ingested once ``wiki init`` has been run. Returning []
+        # would look like a successful write-back that produced nothing.
+        raise WikiNotInitialized(
+            f"no wiki at {layout.wiki_dir} — run: workflow-orchestrator wiki init <path>"
         )
-        return []
 
     from ..services.workflow import session_worktree
 
@@ -488,12 +521,69 @@ async def run_post_merge(settings: Settings, project_id: str, session_id: str) -
     return written
 
 
+#: Sessions whose write-back is queued or running in *this* process. The merge
+#: poller ticks every 60s and a write-back takes minutes, so the durable claim
+#: alone is not enough — it is not written until the task starts, leaving a
+#: window between ``submit()`` and the consumer picking the task up.
+_IN_FLIGHT: set[str] = set()
+
+
+async def _claim(session_id: str, when: str | None) -> None:
+    """Stamp (or clear) the write-back claim in its own transaction.
+
+    Its own, specifically: ``submit()`` starts the queue consumer, which resumes
+    at the caller's next await — which is the caller's own ``commit()``. Writing
+    the claim from inside ``_on_merged``'s transaction would put the queued task
+    in contention with an uncommitted write on the same row.
+    """
+    async with session_scope() as db:
+        session = await db.get(Session, session_id)
+        if session is not None:
+            session.wiki_writeback_at = when
+
+
 async def enqueue_post_merge(
     settings: Settings, project_id: str, session_id: str
-) -> None:
-    """FR-29 — queue the post-merge write-back (FR-42 serialises it)."""
-    queue = get_queue()
-    queue.submit(
-        f"post-merge:{session_id}",
-        lambda: run_post_merge(settings, project_id, session_id),
-    )
+) -> asyncio.Future[list[str]] | None:
+    """FR-29 — queue the post-merge write-back (FR-42 serialises it).
+
+    The claim is released if the task fails. That is deliberate and it is the
+    whole point: this write-back was previously gated on ``completed_at``, and a
+    guard that silently makes ingestion unreachable forever is exactly the bug
+    being fixed here. A failure that retries every poll tick is loud and heals
+    itself when the environment does; a permanent silent skip never does.
+
+    Returns the queued task's future, or ``None`` when this session is already
+    in flight. Callers that must not block — every API path — ignore it; the CLI
+    awaits it, because a process that exits before the queue drains does nothing.
+    """
+    if session_id in _IN_FLIGHT:
+        log.info("wiki.writeback_already_in_flight", session_id=session_id)
+        return None
+    _IN_FLIGHT.add(session_id)
+
+    async def _task() -> list[str]:
+        try:
+            await _claim(session_id, utcnow())
+            return await run_post_merge(settings, project_id, session_id)
+        except WikiNotInitialized as exc:
+            # Configuration, not failure: release and stay quiet enough that a
+            # project with no wiki does not fill the log with tracebacks.
+            await _claim(session_id, None)
+            log.warning(
+                "wiki.writeback_skipped", session_id=session_id, error=str(exc)
+            )
+            return []
+        except Exception:
+            await _claim(session_id, None)
+            log.error("wiki.writeback_failed", session_id=session_id, exc_info=True)
+            raise
+        finally:
+            _IN_FLIGHT.discard(session_id)
+
+    return get_queue().submit(f"post-merge:{session_id}", _task)
+
+
+def release_in_flight(session_id: str) -> None:
+    """Forget a process-local claim so a forced re-run can proceed."""
+    _IN_FLIGHT.discard(session_id)

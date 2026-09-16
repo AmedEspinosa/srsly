@@ -18,24 +18,38 @@ PAGE_PATH = f"{WIKI_ROOT}/concepts/rate-limiting.md"
 PAGE_BODY = "---\ntitle: Rate limiting\nneeds_review: true\n---\n\n# Rate limiting\n\nNotes.\n"
 
 
-@pytest.fixture
-def initialized_wiki(wiki_repo: Path) -> Path:
-    """A scaffolded wiki repo under git, with one automated page written."""
-    init_wiki_repo(wiki_repo)
-    env = {
+def _git_env(root: Path) -> dict[str, str]:
+    return {
         "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
-        "HOME": str(wiki_repo),
+        "HOME": str(root),
         "GIT_AUTHOR_NAME": "t",
         "GIT_AUTHOR_EMAIL": "t@e",
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@e",
     }
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=wiki_repo, check=True, env=env)
-    subprocess.run(["git", "add", "-A"], cwd=wiki_repo, check=True, env=env, capture_output=True)
+
+
+def _git_commit(root: Path, message: str) -> None:
+    env = _git_env(root)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, env=env, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-qm", "scaffold"], cwd=wiki_repo, check=True, env=env,
+        ["git", "commit", "-qm", message], cwd=root, check=True, env=env,
         capture_output=True,
     )
+
+
+def _git_init(root: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"], cwd=root, check=True, env=_git_env(root)
+    )
+    _git_commit(root, "scaffold")
+
+
+@pytest.fixture
+def initialized_wiki(wiki_repo: Path) -> Path:
+    """A scaffolded wiki repo under git, with one automated page written."""
+    init_wiki_repo(wiki_repo)
+    _git_init(wiki_repo)
 
     page = layout_for(wiki_repo).resolve(PAGE_PATH)
     page.parent.mkdir(parents=True, exist_ok=True)
@@ -119,8 +133,145 @@ async def test_reject_removes_a_newly_created_page(
 async def test_path_traversal_is_rejected(
     client: AsyncClient, project: dict, initialized_wiki: Path
 ) -> None:
-    response = await client.get("/wiki/review-queue/../../etc/passwd/diff")
-    assert response.status_code in (400, 404)
+    """Asserted against the handler, not over HTTP.
+
+    httpx normalises ``..`` out of a URL client-side per RFC 3986, so the
+    equivalent request never reached the handler and the 404 came from the
+    router — the test passed without exercising any of this code.
+    """
+    from fastapi import HTTPException
+
+    from workflow_orchestrator.api.wiki import _locate_page
+
+    async with session_scope() as db:
+        for escaping in ("../../etc/passwd", f"{WIKI_ROOT}/../../../etc/passwd"):
+            with pytest.raises(HTTPException) as caught:
+                await _locate_page(db, escaping)
+            assert caught.value.status_code == 400
+
+
+# --- resolving a page to the right wiki repo -----------------------------------
+
+
+@pytest.fixture
+def nested_wiki(wiki_repo: Path) -> Path:
+    """A vault that keeps its page directories under ``llm-wiki/wiki/``.
+
+    The shape the real vault uses, and the one the old lookup could not see.
+    """
+    init_wiki_repo(wiki_repo)
+    nested = wiki_repo / WIKI_ROOT / "wiki"
+    nested.mkdir(parents=True, exist_ok=True)
+    (wiki_repo / WIKI_ROOT / "concepts").rename(nested / "concepts")
+    _git_init(wiki_repo)
+
+    page = nested / "concepts" / "rate-limiting.md"
+    page.write_text(PAGE_BODY, encoding="utf-8")
+    return wiki_repo
+
+
+async def test_page_is_found_in_a_nested_vault(
+    client: AsyncClient, project: dict, nested_wiki: Path
+) -> None:
+    """A canonical stored path must resolve against a nested vault."""
+    await add_wiki_write(PAGE_PATH)
+    response = await client.get(f"/wiki/review-queue/{PAGE_PATH}/diff")
+    assert response.status_code == 200
+    assert "Rate limiting" in response.json()["content"]
+
+
+async def test_page_is_not_resolved_against_an_unrelated_project(
+    client: AsyncClient, project: dict, repo: Path, tmp_path: Path
+) -> None:
+    """With two distinct vaults, the page must come from the one that has it.
+
+    The old lookup joined the *configured* wiki path with a path stored relative
+    to the discovered repo root, so it never matched and always fell back to the
+    first project in the table.
+    """
+    other_root = tmp_path / "other-wiki"
+    (other_root / WIKI_ROOT).mkdir(parents=True)
+    init_wiki_repo(other_root)
+    _git_init(other_root)
+    marker = "# Only in the second vault\n"
+    page = layout_for(other_root).resolve(PAGE_PATH)
+    page.parent.mkdir(parents=True, exist_ok=True)
+    page.write_text(f"---\nneeds_review: true\n---\n\n{marker}", encoding="utf-8")
+
+    created = await client.post(
+        "/projects",
+        json={
+            "name": "second",
+            "repo_path": str(repo),
+            "wiki_repo_path": str(other_root),
+            "wiki_super_summary_path": "llm-wiki/super-summaries/second.md",
+        },
+    )
+    assert created.status_code == 201
+
+    await add_wiki_write(PAGE_PATH)
+    response = await client.get(f"/wiki/review-queue/{PAGE_PATH}/diff")
+    assert response.status_code == 200
+    assert marker in response.json()["content"]
+
+
+async def test_unknown_page_is_404_not_a_guess(
+    client: AsyncClient, project: dict, initialized_wiki: Path
+) -> None:
+    missing = f"{WIKI_ROOT}/concepts/never-written.md"
+    await add_wiki_write(missing)
+    assert (await client.get(f"/wiki/review-queue/{missing}/diff")).status_code == 404
+
+
+async def test_reject_clears_the_flag_on_a_committed_page(
+    client: AsyncClient, project: dict, initialized_wiki: Path
+) -> None:
+    """The bug that left 95 pages flagged in the file and reviewed in the queue.
+
+    ``git checkout`` restores the committed version, which carries
+    ``needs_review: true`` — so without clearing it afterwards the file and the
+    queue disagree forever.
+    """
+    page = layout_for(initialized_wiki).resolve(PAGE_PATH)
+    _git_commit(initialized_wiki, "commit the flagged page")
+    assert "needs_review: true" in page.read_text()
+
+    await add_wiki_write()
+    result = (await client.post(f"/wiki/review-queue/{PAGE_PATH}/reject")).json()
+
+    assert result["reverted"] is True
+    assert result["frontmatter_cleared"] is True
+    assert "needs_review: false" in page.read_text()
+
+    queue = (await client.get("/wiki/review-queue")).json()
+    assert queue["items"] == []
+
+
+async def test_approve_adds_the_key_when_frontmatter_lacks_it(
+    client: AsyncClient, project: dict, initialized_wiki: Path
+) -> None:
+    page = layout_for(initialized_wiki).resolve(PAGE_PATH)
+    page.write_text("---\ntitle: Rate limiting\n---\n\nBody.\n", encoding="utf-8")
+    await add_wiki_write()
+
+    result = (await client.post(f"/wiki/review-queue/{PAGE_PATH}/approve")).json()
+    assert result["frontmatter_cleared"] is True
+    assert "needs_review: false" in page.read_text()
+
+
+async def test_approve_leaves_a_page_with_no_frontmatter_alone(
+    client: AsyncClient, project: dict, initialized_wiki: Path
+) -> None:
+    """A page that never had frontmatter was never flagged; do not invent one."""
+    page = layout_for(initialized_wiki).resolve(PAGE_PATH)
+    page.write_text("# Just a page\n", encoding="utf-8")
+    await add_wiki_write()
+
+    result = (await client.post(f"/wiki/review-queue/{PAGE_PATH}/approve")).json()
+    assert result["frontmatter_cleared"] is False
+    assert page.read_text() == "# Just a page\n"
+    # The queue entry is still cleared — the human did review it.
+    assert (await client.get("/wiki/review-queue")).json()["items"] == []
 
 
 # --- FR-41 / AC-8 --------------------------------------------------------------
