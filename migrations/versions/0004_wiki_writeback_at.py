@@ -1,7 +1,7 @@
 """Decouple the wiki write-back from session completion.
 
-Revision ID: 0003
-Revises: 0002
+Revision ID: 0004
+Revises: 0003
 Create Date: 2026-08-05
 
 ``completed_at`` was doing two jobs: recording that the session was finished,
@@ -39,8 +39,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0003"
-down_revision = "0002"
+revision = "0004"
+down_revision = "0003"
 branch_labels = None
 depends_on = None
 

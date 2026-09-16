@@ -337,7 +337,7 @@ async def test_poller_skips_sessions_already_written_back(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The predicate reads the write-back claim, which is what 0003 backfills."""
+    """The predicate reads the write-back claim, which is what 0004 backfills."""
     ids = []
     for _ in range(2):
         created = await client.post(
